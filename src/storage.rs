@@ -2,7 +2,7 @@
 use soroban_sdk::{Address, Env, contracttype};
 
 use crate::errors::Error;
-use crate::types::{Booking, Config};
+use crate::types::{Booking, CancelSettlement, Config};
 
 #[contracttype]
 #[derive(Clone)]
@@ -11,6 +11,7 @@ pub enum DataKey {
     NextBookingId,
     Booking(u64),
     Claimable(Address),
+    CancelSettlement(u64),
 }
 
 pub fn set_config(env: &Env, config: &Config) {
@@ -64,4 +65,16 @@ pub fn set_claimable(env: &Env, who: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::Claimable(who.clone()), &amount);
+}
+
+pub fn set_cancel_settlement(env: &Env, booking_id: u64, settlement: &CancelSettlement) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CancelSettlement(booking_id), settlement);
+}
+
+pub fn get_cancel_settlement(env: &Env, booking_id: u64) -> Option<CancelSettlement> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CancelSettlement(booking_id))
 }

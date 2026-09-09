@@ -1,14 +1,14 @@
 #![cfg(test)]
-//! Lifecycle + Step 3 USDC escrow tests.
+//! Lifecycle, escrow, settlement, and traveller-cancellation tests.
 use soroban_sdk::{
     Address, Env, IntoVal,
-    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     token,
 };
 
 use crate::{
-    BookingState, Config, DEFAULT_HOST_CANCEL_FEE, Error, StelloBookingContract,
-    StelloBookingContractClient,
+    BookingState, Config, DEFAULT_HOST_CANCEL_FEE, Error, FOUR_WEEKS, StelloBookingContract,
+    StelloBookingContractClient, TWO_WEEKS,
 };
 
 struct TestCtx {
@@ -53,6 +53,13 @@ impl TestCtx {
         self.client().lock_escrow(&booking_id, &amount);
         self.client().check_in(&booking_id);
         self.client().complete(&booking_id);
+        booking_id
+    }
+
+    /// book with start_time → lock escrow (Escrowed, ready to cancel).
+    fn reach_escrowed(&self, amount: i128, start_time: u64) -> u64 {
+        let booking_id = self.fund_and_book(amount, start_time);
+        self.client().lock_escrow(&booking_id, &amount);
         booking_id
     }
 }
@@ -609,4 +616,169 @@ fn full_lifecycle_with_settlement_and_claims() {
     assert_eq!(ctx.token_client().balance(&ctx.qa), 3_000_000);
     assert_eq!(ctx.token_client().balance(&ctx.o2o), 2_000_000);
     assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+// --- Step 5: Traveller cancellation ---
+
+#[test]
+fn traveller_cancel_exactly_four_weeks() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+
+    let s = ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(s.traveller_amount, 70);
+    assert_eq!(s.host_amount, 15);
+    assert_eq!(s.ops_amount, 15);
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Cancelled);
+    assert!(b.settled);
+    assert!(b.was_cancelled);
+    assert_eq!(b.escrow_amount, 0);
+
+    let stored = ctx.client().get_cancel_settlement(&booking_id);
+    assert_eq!(stored, s);
+
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 70);
+    assert_eq!(ctx.token_client().balance(&ctx.host), 15);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 15);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn traveller_cancel_just_under_four_weeks() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS - 1);
+
+    let s = ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(s.traveller_amount, 50);
+    assert_eq!(s.host_amount, 35);
+    assert_eq!(s.ops_amount, 15);
+}
+
+#[test]
+fn traveller_cancel_exactly_two_weeks() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, TWO_WEEKS);
+
+    let s = ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(s.traveller_amount, 50);
+    assert_eq!(s.host_amount, 35);
+    assert_eq!(s.ops_amount, 15);
+}
+
+#[test]
+fn traveller_cancel_just_under_two_weeks() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, TWO_WEEKS - 1);
+
+    let s = ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(s.traveller_amount, 0);
+    assert_eq!(s.host_amount, 80);
+    assert_eq!(s.ops_amount, 20);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.host), 80);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 20);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn traveller_cancel_less_than_two_weeks() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, TWO_WEEKS / 2);
+
+    let s = ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(s.traveller_amount, 0);
+    assert_eq!(s.host_amount, 80);
+    assert_eq!(s.ops_amount, 20);
+}
+
+#[test]
+fn traveller_cancel_rejects_invalid_state() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, FOUR_WEEKS);
+    assert_eq!(
+        ctx.client().try_cancel_by_traveller(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    let booking_id = ctx.reach_completed(amount);
+    assert_eq!(
+        ctx.client().try_cancel_by_traveller(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn traveller_cancel_rejects_repeated_cancellation() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+    ctx.client().cancel_by_traveller(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_cancel_by_traveller(&booking_id),
+        Err(Ok(Error::AlreadyCancelled))
+    );
+    // Also blocked from completion settlement.
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn traveller_cancel_rejects_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let cfg = Config {
+        stello_wallet: stello.clone(),
+        token: token.clone(),
+        ops_pool: ops,
+        review_pool: review,
+        qa_pool: qa,
+        o2o_pool: o2o,
+        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
+    };
+    client.initialize(&cfg);
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &FOUR_WEEKS);
+    client.lock_escrow(&booking_id, &amount);
+
+    env.set_auths(&[]);
+    let result = client.try_cancel_by_traveller(&booking_id);
+    assert!(
+        result.is_err(),
+        "expected unauthorized cancel_by_traveller to fail"
+    );
 }

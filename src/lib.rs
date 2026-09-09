@@ -5,8 +5,8 @@
 //!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
-//!   `execute_split`.
-//! - Cancellation and dispute are deferred to later steps.
+//!   `execute_split`, `cancel_by_traveller`.
+//! - Host cancellation and dispute are deferred to later steps.
 
 mod errors;
 mod events;
@@ -26,12 +26,12 @@ pub use state_machine::{is_terminal, validate_transition};
 pub use types::*;
 
 use events::{
-    BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated, EscrowLocked,
-    PayoutClaimed, SettlementExecuted,
+    BookingCancelled, BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated,
+    CancelSettlementExecuted, EscrowLocked, PayoutClaimed, SettlementExecuted,
 };
 use storage::{
-    get_claimable, get_config, next_booking_id, require_booking, require_config, set_booking,
-    set_claimable, set_config,
+    get_cancel_settlement as load_cancel_settlement, get_claimable, get_config, next_booking_id,
+    require_booking, require_config, set_booking, set_cancel_settlement, set_claimable, set_config,
 };
 
 use soroban_sdk::{Address, Env, contract, contractimpl, token};
@@ -66,6 +66,10 @@ impl StelloBookingContract {
 
     pub fn get_claimable_balance(env: Env, who: Address) -> i128 {
         get_claimable(&env, &who)
+    }
+
+    pub fn get_cancel_settlement(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
+        load_cancel_settlement(&env, booking_id).ok_or(Error::BookingNotFound)
     }
 
     /// Create booking in `Created`. **Auth:** Stello wallet.
@@ -299,7 +303,101 @@ impl StelloBookingContract {
         Ok(split)
     }
 
-    /// Withdraw claimable USDC (Host / O2O pull-pay). **Auth:** claimant.
+    /// Traveller cancellation while `Escrowed`. **Auth:** Stello wallet only.
+    ///
+    /// Tiered refund from `start_time` vs ledger timestamp:
+    /// - `>= 4 weeks`: Traveller 70% / Host 15% / Ops 15%
+    /// - `2–4 weeks`: Traveller 50% / Host 35% / Ops 15%
+    /// - `< 2 weeks`: Traveller 0% / Host 80% / Ops 20%
+    ///
+    /// Traveller, Host, and Ops shares are pushed atomically from escrow.
+    /// Marks booking `Cancelled` + `settled`.
+    pub fn cancel_by_traveller(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
+        let config = require_config(&env)?;
+        require_stello(&config);
+        let mut booking = require_booking(&env, booking_id)?;
+
+        if booking.was_cancelled || booking.state == BookingState::Cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
+        if booking.state != BookingState::Escrowed {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_transition(booking.state, BookingState::Cancelled)?;
+        if booking.escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let settlement = compute_refund(
+            booking.escrow_amount,
+            booking.start_time,
+            now,
+            CancelledBy::Traveller,
+        )?;
+        let total = settlement
+            .traveller_amount
+            .checked_add(settlement.host_amount)
+            .and_then(|v| v.checked_add(settlement.ops_amount))
+            .ok_or(Error::MathError)?;
+        if total != booking.escrow_amount {
+            return Err(Error::MathError);
+        }
+
+        // Effects (CEI): cancel + settle, store allocation, then push all shares.
+        booking.state = BookingState::Cancelled;
+        booking.was_cancelled = true;
+        booking.cancelled_by = CancelledBy::Traveller;
+        booking.settled = true;
+        booking.escrow_amount = 0;
+        set_booking(&env, &booking);
+        set_cancel_settlement(&env, booking_id, &settlement);
+
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &booking.traveller,
+            settlement.traveller_amount,
+        );
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &booking.host,
+            settlement.host_amount,
+        );
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &config.ops_pool,
+            settlement.ops_amount,
+        );
+
+        BookingCancelled {
+            booking_id,
+            by_host: false,
+            traveller_amount: settlement.traveller_amount,
+            host_amount: settlement.host_amount,
+            ops_amount: settlement.ops_amount,
+        }
+        .publish(&env);
+
+        CancelSettlementExecuted {
+            booking_id,
+            traveller_amount: settlement.traveller_amount,
+            host_amount: settlement.host_amount,
+            ops_amount: settlement.ops_amount,
+        }
+        .publish(&env);
+
+        Ok(settlement)
+    }
+
+    /// Withdraw claimable USDC (if any). **Auth:** claimant.
     pub fn claim_payout(env: Env, who: Address) -> Result<i128, Error> {
         who.require_auth();
         let config = require_config(&env)?;

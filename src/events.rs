@@ -82,3 +82,24 @@ pub struct PayoutClaimed {
     pub amount: i128,
     pub token: Address,
 }
+
+#[contractevent(topics = ["booking", "cancelled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BookingCancelled {
+    #[topic]
+    pub booking_id: u64,
+    pub by_host: bool,
+    pub traveller_amount: i128,
+    pub host_amount: i128,
+    pub ops_amount: i128,
+}
+
+#[contractevent(topics = ["cancel", "settled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelSettlementExecuted {
+    #[topic]
+    pub booking_id: u64,
+    pub traveller_amount: i128,
+    pub host_amount: i128,
+    pub ops_amount: i128,
+}
