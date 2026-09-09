@@ -1,7 +1,7 @@
 //! Contract events for off-chain indexers.
 use soroban_sdk::{Address, contractevent};
 
-use crate::types::SplitAmounts;
+use crate::types::SettlementType;
 
 #[contractevent(topics = ["booking", "created"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,35 +54,14 @@ pub struct BookingCompleted {
 pub struct SettlementExecuted {
     #[topic]
     pub booking_id: u64,
+    pub settlement_type: SettlementType,
     pub traveller_amount: i128,
     pub host_amount: i128,
     pub ops_amount: i128,
     pub review_amount: i128,
     pub qa_amount: i128,
     pub o2o_amount: i128,
-}
-
-impl SettlementExecuted {
-    pub fn from_split(booking_id: u64, split: &SplitAmounts) -> Self {
-        Self {
-            booking_id,
-            traveller_amount: 0,
-            host_amount: split.host_amount,
-            ops_amount: split.ops_amount,
-            review_amount: split.review_amount,
-            qa_amount: split.qa_amount,
-            o2o_amount: split.o2o_amount,
-        }
-    }
-}
-
-#[contractevent(topics = ["payout", "claimed"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutClaimed {
-    #[topic]
-    pub claimant: Address,
-    pub amount: i128,
-    pub token: Address,
+    pub timestamp: u64,
 }
 
 #[contractevent(topics = ["booking", "cancelled"])]
@@ -91,16 +70,6 @@ pub struct BookingCancelled {
     #[topic]
     pub booking_id: u64,
     pub by_host: bool,
-    pub traveller_amount: i128,
-    pub host_amount: i128,
-    pub ops_amount: i128,
-}
-
-#[contractevent(topics = ["cancel", "settled"])]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CancelSettlementExecuted {
-    #[topic]
-    pub booking_id: u64,
     pub traveller_amount: i128,
     pub host_amount: i128,
     pub ops_amount: i128,

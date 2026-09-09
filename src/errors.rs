@@ -21,8 +21,11 @@ pub enum Error {
     InvalidBpsAllocation = 14,
     MathError = 15,
     InvalidUpdate = 16,
-    /// Escrow would exceed booking.amount.
     EscrowExceedsAmount = 17,
-    /// Nothing claimable for caller.
-    NothingToClaim = 18,
+    /// Contract token balance is below accounted total_escrowed.
+    Insolvent = 18,
+    /// start_time must be strictly after current ledger timestamp.
+    InvalidStartTime = 19,
+    /// Cancel settlement record missing.
+    SettlementNotFound = 20,
 }
