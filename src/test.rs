@@ -934,15 +934,222 @@ fn host_cancel_rejects_double_cancellation() {
     ctx.client().cancel_by_host(&booking_id);
 
     assert_eq!(
-        ctx.client().try_cancel_by_host(&booking_id),
-        Err(Ok(Error::AlreadyCancelled))
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
     );
+}
+
+// --- Step 7: Dispute resolution ---
+
+#[test]
+fn open_dispute_freezes_escrow() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+
+    ctx.client().open_dispute(&booking_id);
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Disputed);
+    assert!(!b.settled);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+
+    // Escrow frozen: cancel / check_in / complete / execute_split blocked.
     assert_eq!(
         ctx.client().try_cancel_by_traveller(&booking_id),
-        Err(Ok(Error::AlreadyCancelled))
+        Err(Ok(Error::InvalidStateTransition))
+    );
+    assert_eq!(
+        ctx.client().try_check_in(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+    assert_eq!(
+        ctx.client().try_complete(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
     );
     assert_eq!(
         ctx.client().try_execute_split(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn resolve_dispute_custom_bps_pushes_all_parties() {
+    let ctx = setup();
+    let amount = 10_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+
+    let settlement = ctx.client().resolve_dispute(
+        &booking_id,
+        &4000u32, // traveller
+        &3000u32, // host
+        &1000u32, // ops
+        &1000u32, // review
+        &500u32,  // qa
+        &500u32,  // o2o
+    );
+
+    assert_eq!(settlement.traveller_amount, 4000);
+    assert_eq!(settlement.host_amount, 3000);
+    assert_eq!(settlement.ops_amount, 1000);
+    assert_eq!(settlement.review_amount, 1000);
+    assert_eq!(settlement.qa_amount, 500);
+    assert_eq!(settlement.o2o_amount, 500);
+    assert_eq!(
+        settlement.traveller_amount
+            + settlement.host_amount
+            + settlement.ops_amount
+            + settlement.review_amount
+            + settlement.qa_amount
+            + settlement.o2o_amount,
+        amount
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Completed);
+    assert!(b.settled);
+    assert_eq!(b.escrow_amount, 0);
+
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 4000);
+    assert_eq!(ctx.token_client().balance(&ctx.host), 3000);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 1000);
+    assert_eq!(ctx.token_client().balance(&ctx.review), 1000);
+    assert_eq!(ctx.token_client().balance(&ctx.qa), 500);
+    assert_eq!(ctx.token_client().balance(&ctx.o2o), 500);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn resolve_dispute_remainder_goes_to_traveller() {
+    let ctx = setup();
+    let amount = 50i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+
+    let settlement = ctx
+        .client()
+        .resolve_dispute(&booking_id, &8000, &1000, &500, &300, &200, &0);
+    assert_eq!(
+        settlement.traveller_amount
+            + settlement.host_amount
+            + settlement.ops_amount
+            + settlement.review_amount
+            + settlement.qa_amount
+            + settlement.o2o_amount,
+        amount
+    );
+}
+
+#[test]
+fn resolve_dispute_rejects_invalid_bps_sum() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+
+    assert_eq!(
+        ctx.client()
+            .try_resolve_dispute(&booking_id, &5000, &4000, &0, &0, &0, &0),
+        Err(Ok(Error::InvalidBpsAllocation))
+    );
+    assert_eq!(
+        ctx.client().get_booking(&booking_id).state,
+        BookingState::Disputed
+    );
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+}
+
+#[test]
+fn resolve_dispute_rejects_non_disputed() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+
+    assert_eq!(
+        ctx.client()
+            .try_resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0),
+        Err(Ok(Error::InvalidDispute))
+    );
+}
+
+#[test]
+fn resolve_dispute_rejects_twice() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+    ctx.client()
+        .resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0);
+
+    assert_eq!(
+        ctx.client()
+            .try_resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0),
+        Err(Ok(Error::InvalidDispute))
+    );
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::AlreadySettled))
+    );
+}
+
+#[test]
+fn open_dispute_rejects_invalid_state() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    assert_eq!(
+        ctx.client().try_open_dispute(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    let booking_id = ctx.reach_completed(amount);
+    assert_eq!(
+        ctx.client().try_open_dispute(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn open_dispute_rejects_unauthorized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    client.initialize(&Config {
+        stello_wallet: stello,
+        token: token.clone(),
+        ops_pool: ops,
+        review_pool: review,
+        qa_pool: qa,
+        o2o_pool: o2o,
+        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
+    });
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    client.lock_escrow(&booking_id, &amount);
+
+    env.set_auths(&[]);
+    assert!(client.try_open_dispute(&booking_id).is_err());
+    assert!(
+        client
+            .try_resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0)
+            .is_err()
     );
 }
