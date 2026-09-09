@@ -23,4 +23,6 @@ pub enum Error {
     InvalidUpdate = 16,
     /// Escrow would exceed booking.amount.
     EscrowExceedsAmount = 17,
+    /// Nothing claimable for caller.
+    NothingToClaim = 18,
 }

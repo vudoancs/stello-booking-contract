@@ -1,11 +1,12 @@
 #![no_std]
 //! # StelloBookingContract
 //!
-//! Booking lifecycle on Soroban (Step 2–3: book → USDC escrow → check-in → complete).
+//! Booking lifecycle on Soroban (book → USDC escrow → check-in → complete → settle).
 //!
 //! ## Roles
-//! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`.
-//! - Settlement transfers, cancellation, and dispute are deferred to later steps.
+//! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
+//!   `execute_split`.
+//! - Cancellation and dispute are deferred to later steps.
 
 mod errors;
 mod events;
@@ -24,9 +25,13 @@ pub use split::{compute_bps_amounts, compute_completion_split};
 pub use state_machine::{is_terminal, validate_transition};
 pub use types::*;
 
-use events::{BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated, EscrowLocked};
+use events::{
+    BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated, EscrowLocked,
+    PayoutClaimed, SettlementExecuted,
+};
 use storage::{
-    get_config, next_booking_id, require_booking, require_config, set_booking, set_config,
+    get_claimable, get_config, next_booking_id, require_booking, require_config, set_booking,
+    set_claimable, set_config,
 };
 
 use soroban_sdk::{Address, Env, contract, contractimpl, token};
@@ -57,6 +62,10 @@ impl StelloBookingContract {
 
     pub fn get_booking_state(env: Env, booking_id: u64) -> Result<BookingState, Error> {
         Ok(require_booking(&env, booking_id)?.state)
+    }
+
+    pub fn get_claimable_balance(env: Env, who: Address) -> i128 {
+        get_claimable(&env, &who)
     }
 
     /// Create booking in `Created`. **Auth:** Stello wallet.
@@ -218,7 +227,7 @@ impl StelloBookingContract {
     }
 
     /// Mark booking completed (`CheckedIn → Completed`). **Auth:** Stello.
-    /// Does not transfer escrow yet (settlement is a later step).
+    /// Does not transfer escrow — call [`Self::execute_split`] to settle.
     pub fn complete(env: Env, booking_id: u64) -> Result<(), Error> {
         let config = require_config(&env)?;
         require_stello(&config);
@@ -233,6 +242,87 @@ impl StelloBookingContract {
 
         BookingCompleted { booking_id }.publish(&env);
         Ok(())
+    }
+
+    /// Settle a `Completed` booking: 80/10/5/3/2 BPS split of escrow.
+    ///
+    /// All shares (Host, Ops, Review, QA, O2O) are pushed atomically from escrow.
+    ///
+    /// **Auth:** Stello wallet. Prevents double settlement.
+    pub fn execute_split(env: Env, booking_id: u64) -> Result<SplitAmounts, Error> {
+        let config = require_config(&env)?;
+        require_stello(&config);
+        let mut booking = require_booking(&env, booking_id)?;
+
+        if booking.state != BookingState::Completed {
+            return Err(Error::InvalidStateTransition);
+        }
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
+        if booking.escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let escrow = booking.escrow_amount;
+        let split = compute_completion_split(escrow)?;
+        let total = split
+            .host_amount
+            .checked_add(split.ops_amount)
+            .and_then(|v| v.checked_add(split.review_amount))
+            .and_then(|v| v.checked_add(split.qa_amount))
+            .and_then(|v| v.checked_add(split.o2o_amount))
+            .ok_or(Error::MathError)?;
+        if total != escrow {
+            return Err(Error::MathError);
+        }
+
+        // Effects before interactions (CEI): mark settled and zero escrow.
+        booking.settled = true;
+        booking.escrow_amount = 0;
+        set_booking(&env, &booking);
+
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+        transfer_from_contract(&token_client, &contract, &booking.host, split.host_amount);
+        transfer_from_contract(&token_client, &contract, &config.ops_pool, split.ops_amount);
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &config.review_pool,
+            split.review_amount,
+        );
+        transfer_from_contract(&token_client, &contract, &config.qa_pool, split.qa_amount);
+        transfer_from_contract(&token_client, &contract, &config.o2o_pool, split.o2o_amount);
+
+        SettlementExecuted::from_split(booking_id, &split).publish(&env);
+        Ok(split)
+    }
+
+    /// Withdraw claimable USDC (Host / O2O pull-pay). **Auth:** claimant.
+    pub fn claim_payout(env: Env, who: Address) -> Result<i128, Error> {
+        who.require_auth();
+        let config = require_config(&env)?;
+        let amount = get_claimable(&env, &who);
+        if amount <= 0 {
+            return Err(Error::NothingToClaim);
+        }
+
+        // CEI: zero balance before transfer.
+        set_claimable(&env, &who, 0);
+
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+        transfer_from_contract(&token_client, &contract, &who, amount);
+
+        PayoutClaimed {
+            claimant: who,
+            amount,
+            token: config.token,
+        }
+        .publish(&env);
+
+        Ok(amount)
     }
 }
 
@@ -252,4 +342,15 @@ fn validate_parties(traveller: &Address, host: &Address) -> Result<(), Error> {
         return Err(Error::InvalidAddress);
     }
     Ok(())
+}
+
+fn transfer_from_contract(
+    token_client: &token::TokenClient,
+    contract: &Address,
+    to: &Address,
+    amount: i128,
+) {
+    if amount > 0 {
+        token_client.transfer(contract, to, &amount);
+    }
 }

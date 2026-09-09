@@ -1,5 +1,5 @@
 //! Storage keys and helpers.
-use soroban_sdk::{Env, contracttype};
+use soroban_sdk::{Address, Env, contracttype};
 
 use crate::errors::Error;
 use crate::types::{Booking, Config};
@@ -10,6 +10,7 @@ pub enum DataKey {
     Config,
     NextBookingId,
     Booking(u64),
+    Claimable(Address),
 }
 
 pub fn set_config(env: &Env, config: &Config) {
@@ -50,4 +51,17 @@ pub fn get_booking(env: &Env, booking_id: u64) -> Option<Booking> {
 
 pub fn require_booking(env: &Env, booking_id: u64) -> Result<Booking, Error> {
     get_booking(env, booking_id).ok_or(Error::BookingNotFound)
+}
+
+pub fn get_claimable(env: &Env, who: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Claimable(who.clone()))
+        .unwrap_or(0)
+}
+
+pub fn set_claimable(env: &Env, who: &Address, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Claimable(who.clone()), &amount);
 }
