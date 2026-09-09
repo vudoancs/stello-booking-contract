@@ -1,7 +1,8 @@
 //! Centralized booking state-transition validation.
 //!
-//! Step 2 lifecycle edges only:
+//! Lifecycle edges:
 //! `Created → Escrowed → CheckedIn → Completed`
+//! `Escrowed → Cancelled` (traveller cancellation)
 use crate::errors::Error;
 use crate::types::BookingState;
 
@@ -12,6 +13,7 @@ pub fn validate_transition(from: BookingState, to: BookingState) -> Result<(), E
         (BookingState::Created, BookingState::Escrowed)
             | (BookingState::Escrowed, BookingState::CheckedIn)
             | (BookingState::CheckedIn, BookingState::Completed)
+            | (BookingState::Escrowed, BookingState::Cancelled)
     );
 
     if allowed {
@@ -44,6 +46,7 @@ mod tests {
             (BookingState::Created, BookingState::Escrowed)
                 | (BookingState::Escrowed, BookingState::CheckedIn)
                 | (BookingState::CheckedIn, BookingState::Completed)
+                | (BookingState::Escrowed, BookingState::Cancelled)
         )
     }
 
@@ -52,6 +55,7 @@ mod tests {
         assert!(validate_transition(BookingState::Created, BookingState::Escrowed).is_ok());
         assert!(validate_transition(BookingState::Escrowed, BookingState::CheckedIn).is_ok());
         assert!(validate_transition(BookingState::CheckedIn, BookingState::Completed).is_ok());
+        assert!(validate_transition(BookingState::Escrowed, BookingState::Cancelled).is_ok());
     }
 
     #[test]
