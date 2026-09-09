@@ -1,7 +1,7 @@
 #![no_std]
 //! # StelloBookingContract
 //!
-//! Booking lifecycle on Soroban (Step 2: book → escrow → check-in → complete).
+//! Booking lifecycle on Soroban (Step 2–3: book → USDC escrow → check-in → complete).
 //!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`.
@@ -85,6 +85,7 @@ impl StelloBookingContract {
             created_at: env.ledger().timestamp(),
             state: BookingState::Created,
             escrow_locked: false,
+            escrow_amount: 0,
             checked_in: false,
             settled: false,
             was_cancelled: false,
@@ -141,14 +142,32 @@ impl StelloBookingContract {
     }
 
     /// Pull USDC from traveller into contract escrow (`Created → Escrowed`).
+    ///
+    /// `amount` must equal `booking.amount` and be `> 0`.
     /// **Auth:** Stello wallet (traveller also signs the token transfer).
-    pub fn lock_escrow(env: Env, booking_id: u64) -> Result<(), Error> {
+    pub fn lock_escrow(env: Env, booking_id: u64, amount: i128) -> Result<(), Error> {
         let config = require_config(&env)?;
         require_stello(&config);
         let mut booking = require_booking(&env, booking_id)?;
+
+        if booking.state != BookingState::Created {
+            return Err(Error::InvalidStateTransition);
+        }
         validate_transition(booking.state, BookingState::Escrowed)?;
-        if booking.escrow_locked {
+
+        if booking.escrow_locked || booking.escrow_amount != 0 {
             return Err(Error::EscrowAlreadyLocked);
+        }
+        if amount <= 0 || amount != booking.amount {
+            return Err(Error::InvalidAmount);
+        }
+
+        let new_escrow = booking
+            .escrow_amount
+            .checked_add(amount)
+            .ok_or(Error::MathError)?;
+        if new_escrow > booking.amount {
+            return Err(Error::EscrowExceedsAmount);
         }
         if booking.token != config.token {
             return Err(Error::InvalidToken);
@@ -157,15 +176,16 @@ impl StelloBookingContract {
         let contract = env.current_contract_address();
         let token_client = token::TokenClient::new(&env, &config.token);
         booking.traveller.require_auth();
-        token_client.transfer(&booking.traveller, &contract, &booking.amount);
+        token_client.transfer(&booking.traveller, &contract, &amount);
 
         booking.state = BookingState::Escrowed;
         booking.escrow_locked = true;
+        booking.escrow_amount = new_escrow;
         set_booking(&env, &booking);
 
         EscrowLocked {
             booking_id,
-            amount: booking.amount,
+            amount,
             token: config.token,
         }
         .publish(&env);

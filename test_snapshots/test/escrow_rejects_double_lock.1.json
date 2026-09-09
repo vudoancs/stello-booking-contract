@@ -115,7 +115,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "100000000"
+                  "i128": "100"
                 }
               ]
             }
@@ -140,7 +140,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "i128": "100000000"
+                  "i128": "100"
                 },
                 {
                   "u64": "1000000"
@@ -152,36 +152,6 @@
         }
       ]
     ],
-    [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5",
-              "function_name": "update_booking",
-              "args": [
-                {
-                  "u64": "1"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "i128": "100000000"
-                },
-                {
-                  "u64": "2000000"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
@@ -195,7 +165,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "100000000"
+                  "i128": "100"
                 }
               ]
             }
@@ -215,7 +185,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "100000000"
+                  "i128": "100"
                 }
               ]
             }
@@ -234,7 +204,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
                     },
                     {
-                      "i128": "100000000"
+                      "i128": "100"
                     }
                   ]
                 }
@@ -246,48 +216,6 @@
       ]
     ],
     [],
-    [],
-    [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5",
-              "function_name": "check_in",
-              "args": [
-                {
-                  "u64": "1"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [],
-    [],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5",
-              "function_name": "complete",
-              "args": [
-                {
-                  "u64": "1"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
     [],
     []
   ],
@@ -371,26 +299,6 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "4270020994084947596"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
                   "nonce": "4837995959683129791"
                 }
               },
@@ -428,50 +336,10 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "5806905060045992000"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "6277191135259896685"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
-                  "nonce": "8370022561469687789"
+                  "nonce": "4270020994084947596"
                 }
               },
               "durability": "temporary",
@@ -527,7 +395,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "100000000"
+                      "i128": "100"
                     }
                   },
                   {
@@ -551,7 +419,7 @@
                       "symbol": "checked_in"
                     },
                     "val": {
-                      "bool": true
+                      "bool": false
                     }
                   },
                   {
@@ -567,7 +435,7 @@
                       "symbol": "escrow_amount"
                     },
                     "val": {
-                      "i128": "100000000"
+                      "i128": "100"
                     }
                   },
                   {
@@ -599,7 +467,7 @@
                       "symbol": "start_time"
                     },
                     "val": {
-                      "u64": "2000000"
+                      "u64": "1000000"
                     }
                   },
                   {
@@ -607,7 +475,7 @@
                       "symbol": "state"
                     },
                     "val": {
-                      "u32": 3
+                      "u32": 1
                     }
                   },
                   {
@@ -824,7 +692,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "100000000"
+                      "i128": "100"
                     }
                   },
                   {
