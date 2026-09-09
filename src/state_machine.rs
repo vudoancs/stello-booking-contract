@@ -2,7 +2,7 @@
 //!
 //! Lifecycle edges:
 //! `Created → Escrowed → CheckedIn → Completed`
-//! `Escrowed → Cancelled` (traveller cancellation)
+//! `Escrowed → Cancelled` (traveller or host cancellation)
 use crate::errors::Error;
 use crate::types::BookingState;
 

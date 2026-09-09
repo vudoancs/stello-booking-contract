@@ -6,7 +6,8 @@
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
 //!   `execute_split`, `cancel_by_traveller`.
-//! - Host cancellation and dispute are deferred to later steps.
+//! - **Host wallet:** `cancel_by_host` (authorizes $5 fee from host, not escrow).
+//! - Dispute is deferred to a later step.
 
 mod errors;
 mod events;
@@ -27,7 +28,8 @@ pub use types::*;
 
 use events::{
     BookingCancelled, BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated,
-    CancelSettlementExecuted, EscrowLocked, PayoutClaimed, SettlementExecuted,
+    CancelSettlementExecuted, EscrowLocked, HostCancellationFeePaid, PayoutClaimed,
+    SettlementExecuted,
 };
 use storage::{
     get_cancel_settlement as load_cancel_settlement, get_claimable, get_config, next_booking_id,
@@ -380,6 +382,94 @@ impl StelloBookingContract {
         BookingCancelled {
             booking_id,
             by_host: false,
+            traveller_amount: settlement.traveller_amount,
+            host_amount: settlement.host_amount,
+            ops_amount: settlement.ops_amount,
+        }
+        .publish(&env);
+
+        CancelSettlementExecuted {
+            booking_id,
+            traveller_amount: settlement.traveller_amount,
+            host_amount: settlement.host_amount,
+            ops_amount: settlement.ops_amount,
+        }
+        .publish(&env);
+
+        Ok(settlement)
+    }
+
+    /// Host cancellation while `Escrowed`. **Auth:** booking host only (not Stello).
+    ///
+    /// - 100% escrow is pushed to Traveller (not reduced by the fee).
+    /// - Host pays `config.host_cancel_fee` USDC from Host wallet → Operations.
+    /// - If the fee transfer fails, the whole call reverts atomically (no host debt).
+    pub fn cancel_by_host(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
+        let config = require_config(&env)?;
+        let mut booking = require_booking(&env, booking_id)?;
+
+        // Host must authorize — Stello cannot impersonate the host.
+        booking.host.require_auth();
+
+        if booking.was_cancelled || booking.state == BookingState::Cancelled {
+            return Err(Error::AlreadyCancelled);
+        }
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
+        if booking.state != BookingState::Escrowed {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_transition(booking.state, BookingState::Cancelled)?;
+        if booking.escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let fee = config.host_cancel_fee;
+        if fee <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let escrow = booking.escrow_amount;
+        let settlement = CancelSettlement {
+            traveller_amount: escrow,
+            host_amount: 0,
+            ops_amount: 0,
+        };
+
+        // Effects (CEI) before external transfers.
+        booking.state = BookingState::Cancelled;
+        booking.was_cancelled = true;
+        booking.cancelled_by = CancelledBy::Host;
+        booking.settled = true;
+        booking.escrow_amount = 0;
+        set_booking(&env, &booking);
+        set_cancel_settlement(&env, booking_id, &settlement);
+
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+
+        // Fee from Host wallet → Ops (NOT from escrow). Fails atomically if insufficient.
+        token_client.transfer(&booking.host, &config.ops_pool, &fee);
+        HostCancellationFeePaid {
+            booking_id,
+            host: booking.host.clone(),
+            ops: config.ops_pool.clone(),
+            amount: fee,
+        }
+        .publish(&env);
+
+        // 100% escrow → Traveller.
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &booking.traveller,
+            settlement.traveller_amount,
+        );
+
+        BookingCancelled {
+            booking_id,
+            by_host: true,
             traveller_amount: settlement.traveller_amount,
             host_amount: settlement.host_amount,
             ops_amount: settlement.ops_amount,
