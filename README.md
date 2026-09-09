@@ -69,11 +69,24 @@ Tag pattern required: `v*-testnet.*` (example: `v0.1.0-testnet.3`).
 
 1. Checks out the **exact tagged commit**
 2. Re-runs CI checks on that commit
-3. Builds optimized WASM with provenance meta (`source_repo`, `commit_sha`) and **fails before deploy** if meta does not match `github.repository` / `github.sha`
-4. Records `sha256sum` of that exact file (must equal `stellar contract info hash --wasm`), then deploys **that same file** with `--optimize=false` (no second optimize/rebuild)
-5. Uses GitHub Environment **`dev`** for constructor config vars and the Testnet deployer secret
-6. Verifies deployed interface; `get_config` via structured JSON exact field match; `get_total_escrowed == 0`; three-way Wasm hash (`sha256sum` == `--wasm` == `--contract-id`)
-7. Publishes artifacts + a **prerelease** on GitHub
+3. Builds optimized WASM with provenance meta (`source_repo=github:<owner>/<repo>`, `commit_sha`) and **fails before deploy** if meta does not match
+4. Records `sha256sum` of that exact file (must equal `stellar contract info hash --wasm`)
+5. Creates a **GitHub build provenance attestation** for that exact WASM, then verifies it with `gh attestation verify`
+6. Deploys **the same file** with `--optimize=false` (no second optimize/rebuild)
+7. Uses GitHub Environment **`dev`** for constructor config vars and the Testnet deployer secret
+8. Verifies deployed interface; `get_config` via structured JSON exact field match; `get_total_escrowed == 0`; three-way Wasm hash
+9. Runs `stellar contract info build` with a short bounded retry (may show **pending** if GitHub indexing lags)
+10. Publishes artifacts + a **prerelease** on GitHub
+
+### Build Verified (GitHub Attestation)
+
+A Testnet release creates a GitHub **build provenance attestation** for the exact deployed WASM.
+
+**Build Verified** means the deployed Wasm hash is associated with a GitHub Actions build attestation for a specific repository/commit (via SEP-55 `source_repo=github:<owner>/<repo>` + attestation API).
+
+It does **not** mean the contract is security-audited, bug-free, or that business logic is certified safe.
+
+Use the next Testnet tag (e.g. `v0.1.0-testnet.5`) for a clean attest→deploy trust chain. Do not expect an older deployed WASM (e.g. `v0.1.0-testnet.4`) to become Build Verified retroactively without rebuilding that exact artifact under the new workflow.
 
 ### Where to find the Contract ID
 
@@ -86,6 +99,7 @@ Tag pattern required: `v*-testnet.*` (example: `v0.1.0-testnet.3`).
 - Constructor args come from Environment **variables** (not committed): `STELLO_WALLET`, `USDC_TOKEN`, `OPS_POOL`, `REVIEW_POOL`, `QA_POOL`, `O2O_POOL`, optional `HOST_CANCEL_FEE` (default `50000000`).
 - Deployer credential is Environment/repo **secret** `STELLAR_TESTNET_SECRET_KEY` (never printed or written into manifests). Referenced only in the tag-triggered deploy job.
 - `pull_request` / push to `dev` / `main` never deploy. Only `refs/tags/v*-testnet.*` deploy.
+- Deploy job permissions include `contents: write`, `id-token: write`, and `attestations: write` (attestation + release only; not on PR CI).
 - `deploy_tx_hash` is omitted from the manifest unless/until Stellar CLI exposes it reliably (Contract ID is mandatory).
 - Testnet releases do **not** deploy Mainnet.
 

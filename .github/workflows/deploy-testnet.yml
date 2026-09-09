@@ -27,8 +27,10 @@ jobs:
     # GitHub Environment gates secrets/vars; only this tag-triggered job uses it.
     environment: dev
     permissions:
-      # Required only for creating/updating the GitHub Release + uploading assets.
+      # Release assets + GitHub artifact attestations (SEP-55 Build Verified).
       contents: write
+      id-token: write
+      attestations: write
 
     env:
       STELLO_WALLET: ${{ vars.STELLO_WALLET }}
@@ -97,7 +99,9 @@ jobs:
         id: build
         run: |
           set -euo pipefail
-          SOURCE_REPO="https://github.com/${{ github.repository }}"
+          # SEP-55 / stellar contract info build require: source_repo=github:<owner>/<repo>
+          # (https://github.com/... is rejected by CLI 28 — only the github: prefix is supported).
+          SOURCE_REPO="github:${{ github.repository }}"
           COMMIT_SHA="${{ github.sha }}"
           stellar contract build \
             --package stello_booking_contract \
@@ -148,8 +152,9 @@ jobs:
             echo "::error::Missing contract meta key commit_sha — refusing deploy"
             exit 1
           fi
-          if [[ "${SOURCE_REPO}" != *"${EXPECTED_REPO}"* ]]; then
-            echo "::error::source_repo (${SOURCE_REPO}) does not reference ${EXPECTED_REPO}"
+          EXPECTED_SOURCE_REPO="github:${EXPECTED_REPO}"
+          if [[ "${SOURCE_REPO}" != "${EXPECTED_SOURCE_REPO}" ]]; then
+            echo "::error::source_repo (${SOURCE_REPO}) != ${EXPECTED_SOURCE_REPO}"
             exit 1
           fi
           if [[ "${COMMIT_SHA}" != "${EXPECTED_SHA}" ]]; then
@@ -175,6 +180,23 @@ jobs:
           mkdir -p deployment artifacts
           cp "${WASM_PATH}" artifacts/stello_booking_contract.wasm
           echo "${FILE_SHA256}  stello_booking_contract.wasm" > artifacts/SHA256SUMS
+
+      - name: Attest exact deployable WASM (GitHub build provenance)
+        id: attest
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ env.WASM_PATH }}
+          subject-name: stello_booking_contract.wasm
+
+      - name: Verify GitHub attestation for exact WASM
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          command -v gh >/dev/null
+          # Fail the job if attestation cannot be verified against this repo.
+          gh attestation verify "${WASM_PATH}" --repo "${{ github.repository }}"
+          echo "github_attestation_verification=pass" >> "${GITHUB_ENV}"
 
       - name: Deploy exact WASM to Stellar Testnet (--optimize=false)
         id: deploy
@@ -399,13 +421,69 @@ jobs:
             exit 1
           fi
 
+      - name: Stellar contract info build (bounded retry; may be eventually consistent)
+        id: build_info
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          BUILD_INFO_STATUS="pending"
+          BUILD_INFO_LOG=""
+
+          # Attestation indexing can lag briefly after create; do not fail the deploy.
+          for attempt in 1 2 3 4 5 6; do
+            echo "stellar contract info build attempt ${attempt}/6"
+            set +e
+            BUILD_INFO_LOG="$(
+              stellar contract info build \
+                --contract-id "${CONTRACT_ID}" \
+                --network "${NETWORK}" \
+                2>&1
+            )"
+            STATUS=$?
+            set -e
+            printf '%s\n' "${BUILD_INFO_LOG}"
+
+            if [[ "${STATUS}" -eq 0 ]]; then
+              # Treat clear success markers from CLI as verified; otherwise keep pending.
+              if printf '%s\n' "${BUILD_INFO_LOG}" | grep -Eiq 'Attestation found|Build Verified|Workflow Run|github.com/.*/actions/runs'; then
+                BUILD_INFO_STATUS="verified"
+                break
+              fi
+              # Successful exit without attestation payload — still pending/unknown.
+              BUILD_INFO_STATUS="pending"
+            else
+              BUILD_INFO_STATUS="pending"
+            fi
+
+            if [[ "${attempt}" -lt 6 ]]; then
+              sleep 10
+            fi
+          done
+
+          {
+            echo "### stellar contract info build"
+            echo
+            echo '```'
+            printf '%s\n' "${BUILD_INFO_LOG}"
+            echo '```'
+            echo
+            echo "Stellar Build Info status: **${BUILD_INFO_STATUS}**"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "stellar_build_info=${BUILD_INFO_STATUS}" >> "${GITHUB_OUTPUT}"
+          echo "STELLAR_BUILD_INFO_STATUS=${BUILD_INFO_STATUS}" >> "${GITHUB_ENV}"
+          if [[ "${BUILD_INFO_STATUS}" != "verified" ]]; then
+            echo "::warning::Stellar Build Info remains pending after retries (deploy still OK if chain checks passed)"
+          fi
+
       - name: Write deployment/testnet.json
         env:
           CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
           WASM_SHA256: ${{ steps.sha.outputs.wasm_sha256 }}
           GIT_TAG: ${{ github.ref_name }}
           GIT_COMMIT: ${{ github.sha }}
-          SOURCE_REPO: https://github.com/${{ github.repository }}
+          SOURCE_REPO: github:${{ github.repository }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         run: |
           set -euo pipefail
           mkdir -p deployment artifacts
@@ -424,6 +502,9 @@ jobs:
               "source_repo": os.environ["SOURCE_REPO"],
           }
           # deploy_tx_hash intentionally omitted (no reliable CLI field).
+          att = os.environ.get("ATTESTATION_URL", "").strip()
+          if att:
+              data["attestation_url"] = att
 
           path = Path("deployment/testnet.json")
           path.write_text(json.dumps(data, indent=2) + "\n")
@@ -444,11 +525,17 @@ jobs:
       - name: Create GitHub prerelease
         env:
           GH_TOKEN: ${{ github.token }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
           CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
           WASM_SHA256="${{ steps.sha.outputs.wasm_sha256 }}"
+          ATTEST_LINE="Build provenance: GitHub Attestation generated"
+          if [[ -n "${ATTESTATION_URL:-}" ]]; then
+            ATTEST_LINE="${ATTEST_LINE}
+          Attestation URL: ${ATTESTATION_URL}"
+          fi
 
           NOTES="$(cat <<EOF
           Stello Booking Contract — Testnet
@@ -458,6 +545,7 @@ jobs:
           Contract ID: ${CONTRACT_ID}
           WASM SHA256: ${WASM_SHA256}
           Network: Stellar Testnet
+          ${ATTEST_LINE}
 
           Artifacts: WASM, SHA256SUMS, deployment/testnet.json
           EOF
@@ -483,6 +571,7 @@ jobs:
 
       - name: Deployment summary
         run: |
+          BUILD_INFO_STATUS="${STELLAR_BUILD_INFO_STATUS:-pending}"
           {
             echo "## Stello Booking Contract Testnet Deployment"
             echo
@@ -497,4 +586,7 @@ jobs:
             echo "| Provenance meta | pass |"
             echo "| get_config (JSON exact) | pass |"
             echo "| get_total_escrowed | 0 |"
+            echo "| Build Attestation | pass |"
+            echo "| GitHub Attestation Verification | pass |"
+            echo "| Stellar Build Info | ${BUILD_INFO_STATUS} |"
           } >> "${GITHUB_STEP_SUMMARY}"

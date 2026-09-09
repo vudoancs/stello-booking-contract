@@ -45,10 +45,11 @@ jobs:
       - name: Build optimized WASM (with provenance meta)
         run: |
           set -euo pipefail
+          # SEP-55 / stellar contract info build: source_repo=github:<owner>/<repo>
           stellar contract build \
             --package stello_booking_contract \
             --optimize \
-            --meta "source_repo=https://github.com/${{ github.repository }}" \
+            --meta "source_repo=github:${{ github.repository }}" \
             --meta "commit_sha=${{ github.sha }}"
           test -f "${WASM_PATH}"
 
@@ -96,8 +97,9 @@ jobs:
             echo "::error::Missing contract meta key commit_sha"
             exit 1
           fi
-          if [[ "${SOURCE_REPO}" != *"${EXPECTED_REPO}"* ]]; then
-            echo "::error::source_repo (${SOURCE_REPO}) does not reference ${EXPECTED_REPO}"
+          EXPECTED_SOURCE_REPO="github:${EXPECTED_REPO}"
+          if [[ "${SOURCE_REPO}" != "${EXPECTED_SOURCE_REPO}" ]]; then
+            echo "::error::source_repo (${SOURCE_REPO}) != ${EXPECTED_SOURCE_REPO}"
             exit 1
           fi
           if [[ "${COMMIT_SHA}" != "${EXPECTED_SHA}" ]]; then
