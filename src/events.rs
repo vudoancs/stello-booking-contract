@@ -103,3 +103,13 @@ pub struct CancelSettlementExecuted {
     pub host_amount: i128,
     pub ops_amount: i128,
 }
+
+#[contractevent(topics = ["host_cancel", "fee_paid"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostCancellationFeePaid {
+    #[topic]
+    pub booking_id: u64,
+    pub host: Address,
+    pub ops: Address,
+    pub amount: i128,
+}

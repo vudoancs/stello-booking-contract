@@ -782,3 +782,167 @@ fn traveller_cancel_rejects_unauthorized_caller() {
         "expected unauthorized cancel_by_traveller to fail"
     );
 }
+
+// --- Step 6: Host cancellation ---
+
+#[test]
+fn host_cancel_successfully() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+
+    // Fund host separately for $5 fee — not from escrow.
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
+    let contract_before = ctx.token_client().balance(&ctx.contract_id);
+    assert_eq!(contract_before, amount);
+
+    let s = ctx.client().cancel_by_host(&booking_id);
+    assert_eq!(s.traveller_amount, amount);
+    assert_eq!(s.host_amount, 0);
+    assert_eq!(s.ops_amount, 0);
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Cancelled);
+    assert!(b.settled);
+    assert_eq!(b.cancelled_by, crate::CancelledBy::Host);
+    assert_eq!(b.escrow_amount, 0);
+
+    // Traveller receives 100% escrow; ops receives exactly $5 from host wallet.
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.ops),
+        DEFAULT_HOST_CANCEL_FEE
+    );
+    assert_eq!(ctx.token_client().balance(&ctx.host), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+
+    let stored = ctx.client().get_cancel_settlement(&booking_id);
+    assert_eq!(stored.traveller_amount, amount);
+}
+
+#[test]
+fn host_cancel_escrow_untouched_by_fee() {
+    let ctx = setup();
+    let amount = 80_000_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE * 2);
+
+    let escrow_before = ctx.token_client().balance(&ctx.contract_id);
+    let host_before = ctx.token_client().balance(&ctx.host);
+    assert_eq!(escrow_before, amount);
+
+    ctx.client().cancel_by_host(&booking_id);
+
+    // Escrow amount went entirely to traveller; fee came only from host wallet.
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), escrow_before);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.host),
+        host_before - DEFAULT_HOST_CANCEL_FEE
+    );
+    assert_eq!(
+        ctx.token_client().balance(&ctx.ops),
+        DEFAULT_HOST_CANCEL_FEE
+    );
+}
+
+#[test]
+fn host_cancel_ops_receives_exactly_five_dollars() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
+
+    ctx.client().cancel_by_host(&booking_id);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.ops),
+        DEFAULT_HOST_CANCEL_FEE
+    );
+}
+
+#[test]
+fn host_cancel_rejects_insufficient_fee() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    // Host has less than $5.
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE - 1);
+
+    let result = ctx.client().try_cancel_by_host(&booking_id);
+    assert!(result.is_err(), "expected insufficient $5 fee to fail");
+
+    // Atomic: booking still Escrowed, escrow intact, no fee paid.
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert!(!b.settled);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 0);
+}
+
+#[test]
+fn host_cancel_rejects_non_host_without_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    client.initialize(&Config {
+        stello_wallet: stello,
+        token: token.clone(),
+        ops_pool: ops.clone(),
+        review_pool: review,
+        qa_pool: qa,
+        o2o_pool: o2o,
+        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
+    });
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    sac_admin.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    client.lock_escrow(&booking_id, &amount);
+
+    // Clear auths: without host signature, cancel_by_host must fail.
+    env.set_auths(&[]);
+    let result = client.try_cancel_by_host(&booking_id);
+    assert!(
+        result.is_err(),
+        "expected non-host / missing host auth to fail"
+    );
+}
+
+#[test]
+fn host_cancel_rejects_double_cancellation() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE * 2);
+    ctx.client().cancel_by_host(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_cancel_by_host(&booking_id),
+        Err(Ok(Error::AlreadyCancelled))
+    );
+    assert_eq!(
+        ctx.client().try_cancel_by_traveller(&booking_id),
+        Err(Ok(Error::AlreadyCancelled))
+    );
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
