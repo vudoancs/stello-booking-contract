@@ -291,30 +291,218 @@ fn escrow_rejects_unauthorized_caller() {
     sac_admin.mint(&traveller, &amount);
     let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
 
-    // Clear auths: lock_escrow without Stello authorization must fail.
+    // Clear auths: lock_escrow without Traveller authorization must fail.
     env.set_auths(&[]);
     let result = client.try_lock_escrow(&booking_id, &amount);
     assert!(result.is_err(), "expected unauthorized lock_escrow to fail");
 }
 
 #[test]
-fn escrow_rejects_insufficient_balance() {
+fn lock_escrow_traveller_succeeds_and_records_traveller_auth() {
     let ctx = setup();
     let amount = 100i128;
-    // Book without funding traveller fully.
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
+
+    // env.auths() is for the most recent invocation only — assert before further calls.
+    let auths = ctx.env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == ctx.traveller),
+        "expected traveller auth on lock_escrow"
+    );
+    assert!(
+        !auths.iter().any(|(addr, _)| *addr == ctx.stello),
+        "stello must not be required to authorize lock_escrow"
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert!(b.escrow_locked);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 0);
+}
+
+#[test]
+fn lock_escrow_stello_alone_cannot_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    // Also fund Stello so a mistaken Stello→contract transfer could succeed if mis-authorized.
+    sac_admin.mint(&stello, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &stello,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "lock_escrow",
+            args: (booking_id, amount).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(
+        client.try_lock_escrow(&booking_id, &amount).is_err(),
+        "Stello alone must not lock Traveller escrow"
+    );
+
+    let b = client.get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Created);
+    assert!(!b.escrow_locked);
+    assert_eq!(b.escrow_amount, 0);
+    assert_eq!(client.get_total_escrowed(), 0);
+    assert_eq!(
+        token::TokenClient::new(&env, &token).balance(&contract_id),
+        0
+    );
+}
+
+#[test]
+fn lock_escrow_host_cannot_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    sac_admin.mint(&host, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &host,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "lock_escrow",
+            args: (booking_id, amount).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_lock_escrow(&booking_id, &amount).is_err());
+    assert_eq!(client.get_booking(&booking_id).state, BookingState::Created);
+}
+
+#[test]
+fn lock_escrow_unrelated_account_cannot_fund() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    sac_admin.mint(&stranger, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "lock_escrow",
+            args: (booking_id, amount).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_lock_escrow(&booking_id, &amount).is_err());
+    assert_eq!(client.get_total_escrowed(), 0);
+}
+
+#[test]
+fn lock_escrow_failed_transfer_leaves_created_and_accounting_unchanged() {
+    let ctx = setup();
+    let amount = 100i128;
     let booking_id = ctx
         .client()
         .book(&ctx.traveller, &ctx.host, &amount, &1_000_000u64);
+    // Traveller underfunded — transfer must fail and roll back.
     ctx.mint(&ctx.traveller, amount - 1);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
 
-    let result = ctx.client().try_lock_escrow(&booking_id, &amount);
-    assert!(result.is_err(), "expected insufficient balance to fail");
-    assert_eq!(
-        ctx.client().get_booking(&booking_id).state,
-        BookingState::Created
-    );
-    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+    assert!(ctx.client().try_lock_escrow(&booking_id, &amount).is_err());
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Created);
+    assert!(!b.escrow_locked);
+    assert_eq!(b.escrow_amount, 0);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
     assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount - 1);
+    assert_eq!(ctx.token_client().balance(&ctx.stello), 0);
 }
 
 #[test]

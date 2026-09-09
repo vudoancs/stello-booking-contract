@@ -8,7 +8,8 @@ Configuration is set **atomically at deploy** via `__constructor`. There is no p
 
 | Actor | Actions |
 |-------|---------|
-| Stello wallet | `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute` |
+| Stello wallet | `book`, `update_booking`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute` |
+| Traveller | `lock_escrow` only (`booking.traveller.require_auth()`; USDC transfer from Traveller into escrow) |
 | Host wallet | `cancel_by_host` only (`booking.host.require_auth()`; `$5` fee from host wallet, not escrow) |
 
 ## Settlement

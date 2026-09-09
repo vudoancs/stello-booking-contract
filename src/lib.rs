@@ -13,8 +13,10 @@
 //! uninitialized window.
 //!
 //! ## Roles
-//! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
+//! - **Stello wallet:** `book`, `update_booking`, `check_in`, `complete`,
 //!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`.
+//! - **Traveller:** `lock_escrow` only (`booking.traveller.require_auth()`; funds
+//!   their own USDC into escrow).
 //! - **Host wallet:** `cancel_by_host` only (`booking.host.require_auth()`).
 //! - Stello Wallet is the sole dispute-resolution authority (MVP; no DAO/multisig).
 
@@ -205,12 +207,19 @@ impl StelloBookingContract {
     ///
     /// `amount` must equal `booking.amount` and be `> 0`.
     /// Increases `total_escrowed` by `amount` (checked).
-    /// **Auth:** Stello wallet (traveller also signs the token transfer).
+    ///
+    /// **Auth:** booking Traveller only (same auth covers the token transfer).
+    /// Stello Wallet does **not** authorize this call.
     pub fn lock_escrow(env: Env, booking_id: u64, amount: i128) -> Result<(), Error> {
         let config = require_config(&env)?;
-        require_stello(&config);
         let mut booking = require_booking(&env, booking_id)?;
 
+        // Traveller is the sole authorizer of funding escrow.
+        booking.traveller.require_auth();
+
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
         if booking.state != BookingState::Created {
             return Err(Error::InvalidStateTransition);
         }
@@ -236,7 +245,7 @@ impl StelloBookingContract {
 
         let contract = env.current_contract_address();
         let token_client = token::TokenClient::new(&env, &config.token);
-        booking.traveller.require_auth();
+        // Transfer before effects: failure reverts the whole invocation (atomicity).
         token_client.transfer(&booking.traveller, &contract, &amount);
 
         booking.state = BookingState::Escrowed;

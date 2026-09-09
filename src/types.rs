@@ -28,7 +28,8 @@ pub enum CancelledBy {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
-    /// Privileged Stello wallet — book/update/lock/check-in/complete (and later cancel/dispute).
+    /// Privileged Stello wallet — book/update/check-in/complete/cancel/dispute.
+    /// Does **not** authorize `lock_escrow` (Traveller funds escrow).
     pub stello_wallet: Address,
     /// Stellar Asset Contract for USDC (or test token).
     pub token: Address,
