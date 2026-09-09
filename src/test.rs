@@ -46,6 +46,15 @@ impl TestCtx {
         self.client()
             .book(&self.traveller, &self.host, &amount, &start_time)
     }
+
+    /// book → lock → check_in → complete (not settled).
+    fn reach_completed(&self, amount: i128) -> u64 {
+        let booking_id = self.fund_and_book(amount, 1_000_000);
+        self.client().lock_escrow(&booking_id, &amount);
+        self.client().check_in(&booking_id);
+        self.client().complete(&booking_id);
+        booking_id
+    }
 }
 
 fn setup() -> TestCtx {
@@ -445,4 +454,159 @@ fn reject_book_non_positive_amount() {
             .try_book(&ctx.traveller, &ctx.host, &0i128, &1_000_000),
         Err(Ok(Error::InvalidAmount))
     );
+}
+
+// --- Step 4: Completed settlement ---
+
+#[test]
+fn execute_split_successful_100_units() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+
+    let split = ctx.client().execute_split(&booking_id);
+    assert_eq!(split.host_amount, 80);
+    assert_eq!(split.ops_amount, 10);
+    assert_eq!(split.review_amount, 5);
+    assert_eq!(split.qa_amount, 3);
+    assert_eq!(split.o2o_amount, 2);
+    assert_eq!(
+        split.host_amount
+            + split.ops_amount
+            + split.review_amount
+            + split.qa_amount
+            + split.o2o_amount,
+        amount
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert!(b.settled);
+    assert_eq!(b.escrow_amount, 0);
+    assert_eq!(b.state, BookingState::Completed);
+
+    // All five shares are pushed immediately.
+    assert_eq!(ctx.token_client().balance(&ctx.host), 80);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 10);
+    assert_eq!(ctx.token_client().balance(&ctx.review), 5);
+    assert_eq!(ctx.token_client().balance(&ctx.qa), 3);
+    assert_eq!(ctx.token_client().balance(&ctx.o2o), 2);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.client().get_claimable_balance(&ctx.host), 0);
+    assert_eq!(ctx.client().get_claimable_balance(&ctx.o2o), 0);
+}
+
+#[test]
+fn execute_split_dust_remainder_to_host() {
+    let ctx = setup();
+    let amount = 50i128;
+    let booking_id = ctx.reach_completed(amount);
+
+    let split = ctx.client().execute_split(&booking_id);
+    // floors 40+5+2+1+1=49, remainder 1 → host 41
+    assert_eq!(split.host_amount, 41);
+    assert_eq!(split.ops_amount, 5);
+    assert_eq!(split.review_amount, 2);
+    assert_eq!(split.qa_amount, 1);
+    assert_eq!(split.o2o_amount, 1);
+    assert_eq!(
+        split.host_amount
+            + split.ops_amount
+            + split.review_amount
+            + split.qa_amount
+            + split.o2o_amount,
+        amount
+    );
+}
+
+#[test]
+fn execute_split_rejects_before_completed() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    ctx.client().lock_escrow(&booking_id, &amount);
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    ctx.client().check_in(&booking_id);
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn execute_split_rejects_double_settlement() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+    ctx.client().execute_split(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::AlreadySettled))
+    );
+}
+
+#[test]
+fn execute_split_rejects_unknown_booking() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client().try_execute_split(&999u64),
+        Err(Ok(Error::BookingNotFound))
+    );
+}
+
+#[test]
+fn claim_payout_rejects_nothing_to_claim_after_push_settlement() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+    ctx.client().execute_split(&booking_id);
+
+    // Host/O2O were pushed; nothing left to claim.
+    assert_eq!(
+        ctx.client().try_claim_payout(&ctx.host),
+        Err(Ok(Error::NothingToClaim))
+    );
+    assert_eq!(
+        ctx.client().try_claim_payout(&ctx.o2o),
+        Err(Ok(Error::NothingToClaim))
+    );
+}
+
+#[test]
+fn claim_payout_rejects_nothing_to_claim() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client().try_claim_payout(&ctx.host),
+        Err(Ok(Error::NothingToClaim))
+    );
+}
+
+#[test]
+fn full_lifecycle_with_settlement_and_claims() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let booking_id = ctx.reach_completed(amount);
+
+    let split = ctx.client().execute_split(&booking_id);
+    assert_eq!(split.host_amount, 80_000_000);
+    assert_eq!(split.ops_amount, 10_000_000);
+    assert_eq!(split.review_amount, 5_000_000);
+    assert_eq!(split.qa_amount, 3_000_000);
+    assert_eq!(split.o2o_amount, 2_000_000);
+
+    assert_eq!(ctx.token_client().balance(&ctx.host), 80_000_000);
+    assert_eq!(ctx.token_client().balance(&ctx.ops), 10_000_000);
+    assert_eq!(ctx.token_client().balance(&ctx.review), 5_000_000);
+    assert_eq!(ctx.token_client().balance(&ctx.qa), 3_000_000);
+    assert_eq!(ctx.token_client().balance(&ctx.o2o), 2_000_000);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
 }
