@@ -54,6 +54,8 @@ pub struct Booking {
     pub created_at: u64,
     pub state: BookingState,
     pub escrow_locked: bool,
+    /// USDC held in contract escrow for this booking (0 until lock; then == amount).
+    pub escrow_amount: i128,
     pub checked_in: bool,
     pub settled: bool,
     pub was_cancelled: bool,

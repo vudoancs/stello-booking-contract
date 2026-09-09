@@ -285,6 +285,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "escrow_amount"
+                    },
+                    "val": {
+                      "i128": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "escrow_locked"
                     },
                     "val": {

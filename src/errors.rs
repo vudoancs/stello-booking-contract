@@ -21,4 +21,6 @@ pub enum Error {
     InvalidBpsAllocation = 14,
     MathError = 15,
     InvalidUpdate = 16,
+    /// Escrow would exceed booking.amount.
+    EscrowExceedsAmount = 17,
 }

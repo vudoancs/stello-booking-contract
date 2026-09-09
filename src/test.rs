@@ -1,6 +1,10 @@
 #![cfg(test)]
-//! Step 2 lifecycle tests: book → lock_escrow → check_in → complete.
-use soroban_sdk::{Address, Env, testutils::Address as _, token};
+//! Lifecycle + Step 3 USDC escrow tests.
+use soroban_sdk::{
+    Address, Env, IntoVal,
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    token,
+};
 
 use crate::{
     BookingState, Config, DEFAULT_HOST_CANCEL_FEE, Error, StelloBookingContract,
@@ -125,7 +129,7 @@ fn valid_lifecycle_created_escrowed_checked_in_completed() {
     assert_eq!(b.start_time, 2_000_000);
     assert_eq!(b.state, BookingState::Created);
 
-    ctx.client().lock_escrow(&booking_id);
+    ctx.client().lock_escrow(&booking_id, &amount);
     assert_eq!(
         ctx.client().get_booking_state(&booking_id),
         BookingState::Escrowed
@@ -150,12 +154,195 @@ fn valid_lifecycle_created_escrowed_checked_in_completed() {
 }
 
 #[test]
+fn successful_escrow() {
+    let ctx = setup();
+    let amount = 50_000_000i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+
+    ctx.client().lock_escrow(&booking_id, &amount);
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert!(b.escrow_locked);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), 0);
+}
+
+#[test]
+fn escrow_rejects_incorrect_amount() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+
+    assert_eq!(
+        ctx.client().try_lock_escrow(&booking_id, &(amount + 1)),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        ctx.client().try_lock_escrow(&booking_id, &(amount - 1)),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Created);
+    assert_eq!(b.escrow_amount, 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount);
+}
+
+#[test]
+fn escrow_rejects_double_lock() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
+
+    assert_eq!(
+        ctx.client().try_lock_escrow(&booking_id, &amount),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+}
+
+#[test]
+fn escrow_rejects_zero_amount() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+
+    assert_eq!(
+        ctx.client().try_lock_escrow(&booking_id, &0i128),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn escrow_rejects_unauthorized_caller() {
+    let env = Env::default();
+    // Do not mock_all_auths — only authorize initialize + book + traveller path partially.
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer.clone());
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let cfg = Config {
+        stello_wallet: stello.clone(),
+        token: token.clone(),
+        ops_pool: ops,
+        review_pool: review,
+        qa_pool: qa,
+        o2o_pool: o2o,
+        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
+    };
+
+    env.mock_auths(&[MockAuth {
+        address: &stello,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: (cfg.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&cfg);
+
+    let amount = 100i128;
+    env.mock_auths(&[MockAuth {
+        address: &stello,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "book",
+            args: (traveller.clone(), host.clone(), amount, 1_000_000u64).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    // Mint needs issuer/admin auth — use mock_all briefly for mint only via StellarAssetClient.
+    // StellarAssetClient mint with mock_all is easier:
+    env.mock_all_auths();
+    sac_admin.mint(&traveller, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+
+    // Clear auths: lock_escrow without Stello authorization must fail.
+    env.set_auths(&[]);
+    let result = client.try_lock_escrow(&booking_id, &amount);
+    assert!(result.is_err(), "expected unauthorized lock_escrow to fail");
+}
+
+#[test]
+fn escrow_rejects_insufficient_balance() {
+    let ctx = setup();
+    let amount = 100i128;
+    // Book without funding traveller fully.
+    let booking_id = ctx
+        .client()
+        .book(&ctx.traveller, &ctx.host, &amount, &1_000_000u64);
+    ctx.mint(&ctx.traveller, amount - 1);
+
+    let result = ctx.client().try_lock_escrow(&booking_id, &amount);
+    assert!(result.is_err(), "expected insufficient balance to fail");
+    assert_eq!(
+        ctx.client().get_booking(&booking_id).state,
+        BookingState::Created
+    );
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn escrow_balance_tracking() {
+    let ctx = setup();
+    let amount = 25_000_000i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+
+    ctx.client().lock_escrow(&booking_id, &amount);
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(b.escrow_amount, b.amount);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.contract_id),
+        b.escrow_amount
+    );
+    assert!(b.escrow_amount <= b.amount);
+}
+
+#[test]
+fn escrow_rejects_invalid_booking() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client().try_lock_escrow(&999u64, &100i128),
+        Err(Ok(Error::BookingNotFound))
+    );
+}
+
+#[test]
 fn reject_lock_escrow_from_non_created() {
     let ctx = setup();
-    let booking_id = ctx.fund_and_book(100, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
     assert_eq!(
-        ctx.client().try_lock_escrow(&booking_id),
+        ctx.client().try_lock_escrow(&booking_id, &amount),
         Err(Ok(Error::InvalidStateTransition))
     );
 }
@@ -173,8 +360,9 @@ fn reject_check_in_from_created() {
 #[test]
 fn reject_check_in_from_checked_in_and_completed() {
     let ctx = setup();
-    let booking_id = ctx.fund_and_book(100, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
     ctx.client().check_in(&booking_id);
     assert_eq!(
         ctx.client().try_check_in(&booking_id),
@@ -203,8 +391,9 @@ fn reject_complete_from_created() {
 #[test]
 fn reject_complete_from_escrowed_without_check_in() {
     let ctx = setup();
-    let booking_id = ctx.fund_and_book(100, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
     assert_eq!(
         ctx.client().try_complete(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
@@ -214,8 +403,9 @@ fn reject_complete_from_escrowed_without_check_in() {
 #[test]
 fn reject_complete_twice() {
     let ctx = setup();
-    let booking_id = ctx.fund_and_book(100, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
     ctx.client().check_in(&booking_id);
     ctx.client().complete(&booking_id);
     assert_eq!(
@@ -229,7 +419,7 @@ fn reject_update_after_escrow_locked() {
     let ctx = setup();
     let amount = 100i128;
     let booking_id = ctx.fund_and_book(amount, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
+    ctx.client().lock_escrow(&booking_id, &amount);
     assert_eq!(
         ctx.client()
             .try_update_booking(&booking_id, &ctx.host, &amount, &2_000_000),
