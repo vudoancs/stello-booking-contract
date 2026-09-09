@@ -698,6 +698,18 @@
                       "val": {
                         "u64": "2"
                       }
+                    },
+                    {
+                      "key": {
+                        "vec": [
+                          {
+                            "symbol": "TotalEscrowed"
+                          }
+                        ]
+                      },
+                      "val": {
+                        "i128": "0"
+                      }
                     }
                   ]
                 }
@@ -1418,6 +1430,22 @@
                   },
                   "val": {
                     "i128": "1"
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "settlement_type"
+                  },
+                  "val": {
+                    "u32": 3
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "timestamp"
+                  },
+                  "val": {
+                    "u64": "0"
                   }
                 },
                 {

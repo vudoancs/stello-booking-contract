@@ -3,10 +3,14 @@
 //!
 //! Booking lifecycle on Soroban (book → USDC escrow → check-in → complete → settle).
 //!
+//! ## Push payments only
+//! All settlement outcomes transfer escrow **immediately** in the same transaction.
+//! There is no claimable / pull-payment model.
+//!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
 //!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`.
-//! - **Host wallet:** `cancel_by_host` (authorizes $5 fee from host, not escrow).
+//! - **Host wallet:** `cancel_by_host` only (`booking.host.require_auth()`).
 //! - Stello Wallet is the sole dispute-resolution authority (MVP; no DAO/multisig).
 
 mod errors;
@@ -28,12 +32,12 @@ pub use types::*;
 
 use events::{
     BookingCancelled, BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated,
-    CancelSettlementExecuted, DisputeOpened, DisputeResolved, EscrowLocked,
-    HostCancellationFeePaid, PayoutClaimed, SettlementExecuted,
+    DisputeOpened, DisputeResolved, EscrowLocked, HostCancellationFeePaid, SettlementExecuted,
 };
 use storage::{
-    get_cancel_settlement as load_cancel_settlement, get_claimable, get_config, next_booking_id,
-    require_booking, require_config, set_booking, set_cancel_settlement, set_claimable, set_config,
+    decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement, get_config,
+    get_total_escrowed, increase_total_escrowed, next_booking_id, require_booking, require_config,
+    set_booking, set_cancel_settlement, set_config,
 };
 
 use soroban_sdk::{Address, Env, contract, contractimpl, token};
@@ -43,7 +47,7 @@ pub struct StelloBookingContract;
 
 #[contractimpl]
 impl StelloBookingContract {
-    /// Initialize protocol config. Caller must be `config.stello_wallet`.
+    /// Initialize protocol config. Caller must be `config.stello_wallet`. One-time only.
     pub fn initialize(env: Env, config: Config) -> Result<(), Error> {
         if get_config(&env).is_some() {
             return Err(Error::AlreadyInitialized);
@@ -66,12 +70,13 @@ impl StelloBookingContract {
         Ok(require_booking(&env, booking_id)?.state)
     }
 
-    pub fn get_claimable_balance(env: Env, who: Address) -> i128 {
-        get_claimable(&env, &who)
+    /// Global accounted escrow (excludes unsolicited token transfers).
+    pub fn get_total_escrowed(env: Env) -> i128 {
+        get_total_escrowed(&env)
     }
 
     pub fn get_cancel_settlement(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
-        load_cancel_settlement(&env, booking_id).ok_or(Error::BookingNotFound)
+        load_cancel_settlement(&env, booking_id).ok_or(Error::SettlementNotFound)
     }
 
     /// Create booking in `Created`. **Auth:** Stello wallet.
@@ -88,6 +93,7 @@ impl StelloBookingContract {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        validate_start_time(&env, start_time)?;
 
         let booking_id = next_booking_id(&env);
         let booking = Booking {
@@ -122,6 +128,8 @@ impl StelloBookingContract {
     }
 
     /// Update booking fields while still `Created` (before escrow). **Auth:** Stello.
+    ///
+    /// `start_time` cannot be changed once the booking is `Escrowed`.
     pub fn update_booking(
         env: Env,
         booking_id: u64,
@@ -139,6 +147,7 @@ impl StelloBookingContract {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
+        validate_start_time(&env, start_time)?;
 
         booking.host = host.clone();
         booking.amount = amount;
@@ -159,6 +168,7 @@ impl StelloBookingContract {
     /// Pull USDC from traveller into contract escrow (`Created → Escrowed`).
     ///
     /// `amount` must equal `booking.amount` and be `> 0`.
+    /// Increases `total_escrowed` by `amount` (checked).
     /// **Auth:** Stello wallet (traveller also signs the token transfer).
     pub fn lock_escrow(env: Env, booking_id: u64, amount: i128) -> Result<(), Error> {
         let config = require_config(&env)?;
@@ -197,6 +207,7 @@ impl StelloBookingContract {
         booking.escrow_locked = true;
         booking.escrow_amount = new_escrow;
         set_booking(&env, &booking);
+        increase_total_escrowed(&env, amount)?;
 
         EscrowLocked {
             booking_id,
@@ -250,9 +261,7 @@ impl StelloBookingContract {
         Ok(())
     }
 
-    /// Settle a `Completed` booking: 80/10/5/3/2 BPS split of escrow.
-    ///
-    /// All shares (Host, Ops, Review, QA, O2O) are pushed atomically from escrow.
+    /// Settle a `Completed` booking: 80/10/5/3/2 push split of escrow.
     ///
     /// **Auth:** Stello wallet. Prevents double settlement.
     pub fn execute_split(env: Env, booking_id: u64) -> Result<SplitAmounts, Error> {
@@ -270,6 +279,8 @@ impl StelloBookingContract {
             return Err(Error::InvalidAmount);
         }
 
+        require_solvency(&env, &config.token)?;
+
         let escrow = booking.escrow_amount;
         let split = compute_completion_split(escrow)?;
         let total = split
@@ -283,10 +294,11 @@ impl StelloBookingContract {
             return Err(Error::MathError);
         }
 
-        // Effects before interactions (CEI): mark settled and zero escrow.
+        // Effects before interactions (CEI).
         booking.settled = true;
         booking.escrow_amount = 0;
         set_booking(&env, &booking);
+        decrease_total_escrowed(&env, escrow)?;
 
         let contract = env.current_contract_address();
         let token_client = token::TokenClient::new(&env, &config.token);
@@ -301,7 +313,19 @@ impl StelloBookingContract {
         transfer_from_contract(&token_client, &contract, &config.qa_pool, split.qa_amount);
         transfer_from_contract(&token_client, &contract, &config.o2o_pool, split.o2o_amount);
 
-        SettlementExecuted::from_split(booking_id, &split).publish(&env);
+        SettlementExecuted {
+            booking_id,
+            settlement_type: SettlementType::Completed,
+            traveller_amount: 0,
+            host_amount: split.host_amount,
+            ops_amount: split.ops_amount,
+            review_amount: split.review_amount,
+            qa_amount: split.qa_amount,
+            o2o_amount: split.o2o_amount,
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
         Ok(split)
     }
 
@@ -311,9 +335,6 @@ impl StelloBookingContract {
     /// - `>= 4 weeks`: Traveller 70% / Host 15% / Ops 15%
     /// - `2–4 weeks`: Traveller 50% / Host 35% / Ops 15%
     /// - `< 2 weeks`: Traveller 0% / Host 80% / Ops 20%
-    ///
-    /// Traveller, Host, and Ops shares are pushed atomically from escrow.
-    /// Marks booking `Cancelled` + `settled`.
     pub fn cancel_by_traveller(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
         let config = require_config(&env)?;
         require_stello(&config);
@@ -333,23 +354,20 @@ impl StelloBookingContract {
             return Err(Error::InvalidAmount);
         }
 
+        require_solvency(&env, &config.token)?;
+
         let now = env.ledger().timestamp();
-        let settlement = compute_refund(
-            booking.escrow_amount,
-            booking.start_time,
-            now,
-            CancelledBy::Traveller,
-        )?;
+        let escrow = booking.escrow_amount;
+        let settlement = compute_refund(escrow, booking.start_time, now, CancelledBy::Traveller)?;
         let total = settlement
             .traveller_amount
             .checked_add(settlement.host_amount)
             .and_then(|v| v.checked_add(settlement.ops_amount))
             .ok_or(Error::MathError)?;
-        if total != booking.escrow_amount {
+        if total != escrow {
             return Err(Error::MathError);
         }
 
-        // Effects (CEI): cancel + settle, store allocation, then push all shares.
         booking.state = BookingState::Cancelled;
         booking.was_cancelled = true;
         booking.cancelled_by = CancelledBy::Traveller;
@@ -357,6 +375,7 @@ impl StelloBookingContract {
         booking.escrow_amount = 0;
         set_booking(&env, &booking);
         set_cancel_settlement(&env, booking_id, &settlement);
+        decrease_total_escrowed(&env, escrow)?;
 
         let contract = env.current_contract_address();
         let token_client = token::TokenClient::new(&env, &config.token);
@@ -388,11 +407,16 @@ impl StelloBookingContract {
         }
         .publish(&env);
 
-        CancelSettlementExecuted {
+        SettlementExecuted {
             booking_id,
+            settlement_type: SettlementType::TravellerCancel,
             traveller_amount: settlement.traveller_amount,
             host_amount: settlement.host_amount,
             ops_amount: settlement.ops_amount,
+            review_amount: 0,
+            qa_amount: 0,
+            o2o_amount: 0,
+            timestamp: now,
         }
         .publish(&env);
 
@@ -403,7 +427,7 @@ impl StelloBookingContract {
     ///
     /// - 100% escrow is pushed to Traveller (not reduced by the fee).
     /// - Host pays `config.host_cancel_fee` USDC from Host wallet → Operations.
-    /// - If the fee transfer fails, the whole call reverts atomically (no host debt).
+    /// - If the fee transfer fails, the whole call reverts atomically.
     pub fn cancel_by_host(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
         let config = require_config(&env)?;
         let mut booking = require_booking(&env, booking_id)?;
@@ -430,6 +454,8 @@ impl StelloBookingContract {
             return Err(Error::InvalidAmount);
         }
 
+        require_solvency(&env, &config.token)?;
+
         let escrow = booking.escrow_amount;
         let settlement = CancelSettlement {
             traveller_amount: escrow,
@@ -437,7 +463,13 @@ impl StelloBookingContract {
             ops_amount: 0,
         };
 
-        // Effects (CEI) before external transfers.
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+
+        // Fee from Host wallet → Ops first (NOT from escrow). If this fails, nothing settles.
+        token_client.transfer(&booking.host, &config.ops_pool, &fee);
+
+        // Effects after fee succeeds; escrow push follows (full tx still atomic).
         booking.state = BookingState::Cancelled;
         booking.was_cancelled = true;
         booking.cancelled_by = CancelledBy::Host;
@@ -445,12 +477,8 @@ impl StelloBookingContract {
         booking.escrow_amount = 0;
         set_booking(&env, &booking);
         set_cancel_settlement(&env, booking_id, &settlement);
+        decrease_total_escrowed(&env, escrow)?;
 
-        let contract = env.current_contract_address();
-        let token_client = token::TokenClient::new(&env, &config.token);
-
-        // Fee from Host wallet → Ops (NOT from escrow). Fails atomically if insufficient.
-        token_client.transfer(&booking.host, &config.ops_pool, &fee);
         HostCancellationFeePaid {
             booking_id,
             host: booking.host.clone(),
@@ -459,7 +487,6 @@ impl StelloBookingContract {
         }
         .publish(&env);
 
-        // 100% escrow → Traveller.
         transfer_from_contract(
             &token_client,
             &contract,
@@ -476,11 +503,16 @@ impl StelloBookingContract {
         }
         .publish(&env);
 
-        CancelSettlementExecuted {
+        SettlementExecuted {
             booking_id,
+            settlement_type: SettlementType::HostCancel,
             traveller_amount: settlement.traveller_amount,
-            host_amount: settlement.host_amount,
-            ops_amount: settlement.ops_amount,
+            host_amount: 0,
+            ops_amount: 0,
+            review_amount: 0,
+            qa_amount: 0,
+            o2o_amount: 0,
+            timestamp: env.ledger().timestamp(),
         }
         .publish(&env);
 
@@ -538,6 +570,8 @@ impl StelloBookingContract {
             return Err(Error::InvalidAmount);
         }
 
+        require_solvency(&env, &config.token)?;
+
         let bps_sum = traveller_bps
             .checked_add(host_bps)
             .and_then(|v| v.checked_add(ops_bps))
@@ -588,11 +622,11 @@ impl StelloBookingContract {
             return Err(Error::EscrowExceedsAmount);
         }
 
-        // Effects (CEI): settle + move to Completed, then push all shares.
         booking.state = BookingState::Completed;
         booking.settled = true;
         booking.escrow_amount = 0;
         set_booking(&env, &booking);
+        decrease_total_escrowed(&env, escrow)?;
 
         let contract = env.current_contract_address();
         let token_client = token::TokenClient::new(&env, &config.token);
@@ -619,16 +653,18 @@ impl StelloBookingContract {
         }
         .publish(&env);
 
-        let settlement_event = SettlementExecuted {
+        SettlementExecuted {
             booking_id,
+            settlement_type: SettlementType::Dispute,
             traveller_amount,
             host_amount,
             ops_amount,
             review_amount,
             qa_amount,
             o2o_amount,
-        };
-        settlement_event.publish(&env);
+            timestamp: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(SettlementAmounts {
             traveller_amount,
@@ -639,32 +675,6 @@ impl StelloBookingContract {
             o2o_amount,
         })
     }
-
-    /// Withdraw claimable USDC (if any). **Auth:** claimant.
-    pub fn claim_payout(env: Env, who: Address) -> Result<i128, Error> {
-        who.require_auth();
-        let config = require_config(&env)?;
-        let amount = get_claimable(&env, &who);
-        if amount <= 0 {
-            return Err(Error::NothingToClaim);
-        }
-
-        // CEI: zero balance before transfer.
-        set_claimable(&env, &who, 0);
-
-        let contract = env.current_contract_address();
-        let token_client = token::TokenClient::new(&env, &config.token);
-        transfer_from_contract(&token_client, &contract, &who, amount);
-
-        PayoutClaimed {
-            claimant: who,
-            amount,
-            token: config.token,
-        }
-        .publish(&env);
-
-        Ok(amount)
-    }
 }
 
 fn require_stello(config: &Config) {
@@ -672,8 +682,41 @@ fn require_stello(config: &Config) {
 }
 
 fn validate_config(config: &Config) -> Result<(), Error> {
-    if config.host_cancel_fee < 0 {
+    if config.host_cancel_fee <= 0 {
         return Err(Error::InvalidAmount);
+    }
+    // Addresses are always "present" in Soroban; require pairwise distinctness so
+    // pools / wallets / token cannot silently collapse into one destination.
+    if config.stello_wallet == config.token
+        || config.ops_pool == config.token
+        || config.review_pool == config.token
+        || config.qa_pool == config.token
+        || config.o2o_pool == config.token
+    {
+        return Err(Error::InvalidAddress);
+    }
+    if config.stello_wallet == config.ops_pool
+        || config.stello_wallet == config.review_pool
+        || config.stello_wallet == config.qa_pool
+        || config.stello_wallet == config.o2o_pool
+    {
+        return Err(Error::InvalidAddress);
+    }
+    if config.ops_pool == config.review_pool
+        || config.ops_pool == config.qa_pool
+        || config.ops_pool == config.o2o_pool
+        || config.review_pool == config.qa_pool
+        || config.review_pool == config.o2o_pool
+        || config.qa_pool == config.o2o_pool
+    {
+        return Err(Error::InvalidAddress);
+    }
+    Ok(())
+}
+
+fn validate_start_time(env: &Env, start_time: u64) -> Result<(), Error> {
+    if start_time <= env.ledger().timestamp() {
+        return Err(Error::InvalidStartTime);
     }
     Ok(())
 }
@@ -681,6 +724,18 @@ fn validate_config(config: &Config) -> Result<(), Error> {
 fn validate_parties(traveller: &Address, host: &Address) -> Result<(), Error> {
     if traveller == host {
         return Err(Error::InvalidAddress);
+    }
+    Ok(())
+}
+
+/// Contract token balance must never be below accounted `total_escrowed`.
+fn require_solvency(env: &Env, token_addr: &Address) -> Result<(), Error> {
+    let contract = env.current_contract_address();
+    let token_client = token::TokenClient::new(env, token_addr);
+    let balance = token_client.balance(&contract);
+    let total = get_total_escrowed(env);
+    if balance < total {
+        return Err(Error::Insolvent);
     }
     Ok(())
 }

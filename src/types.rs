@@ -94,6 +94,17 @@ pub struct SettlementAmounts {
     pub o2o_amount: i128,
 }
 
+/// Distinguishes settlement outcomes in events.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum SettlementType {
+    Completed = 0,
+    TravellerCancel = 1,
+    HostCancel = 2,
+    Dispute = 3,
+}
+
 /// One dispute payout share (BPS of escrow).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

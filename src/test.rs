@@ -498,8 +498,7 @@ fn execute_split_successful_100_units() {
     assert_eq!(ctx.token_client().balance(&ctx.qa), 3);
     assert_eq!(ctx.token_client().balance(&ctx.o2o), 2);
     assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
-    assert_eq!(ctx.client().get_claimable_balance(&ctx.host), 0);
-    assert_eq!(ctx.client().get_claimable_balance(&ctx.o2o), 0);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
 }
 
 #[test]
@@ -571,37 +570,11 @@ fn execute_split_rejects_unknown_booking() {
 }
 
 #[test]
-fn claim_payout_rejects_nothing_to_claim_after_push_settlement() {
-    let ctx = setup();
-    let amount = 100i128;
-    let booking_id = ctx.reach_completed(amount);
-    ctx.client().execute_split(&booking_id);
-
-    // Host/O2O were pushed; nothing left to claim.
-    assert_eq!(
-        ctx.client().try_claim_payout(&ctx.host),
-        Err(Ok(Error::NothingToClaim))
-    );
-    assert_eq!(
-        ctx.client().try_claim_payout(&ctx.o2o),
-        Err(Ok(Error::NothingToClaim))
-    );
-}
-
-#[test]
-fn claim_payout_rejects_nothing_to_claim() {
-    let ctx = setup();
-    assert_eq!(
-        ctx.client().try_claim_payout(&ctx.host),
-        Err(Ok(Error::NothingToClaim))
-    );
-}
-
-#[test]
-fn full_lifecycle_with_settlement_and_claims() {
+fn full_lifecycle_push_settlement() {
     let ctx = setup();
     let amount = 100_000_000i128;
     let booking_id = ctx.reach_completed(amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
 
     let split = ctx.client().execute_split(&booking_id);
     assert_eq!(split.host_amount, 80_000_000);
@@ -616,6 +589,8 @@ fn full_lifecycle_with_settlement_and_claims() {
     assert_eq!(ctx.token_client().balance(&ctx.qa), 3_000_000);
     assert_eq!(ctx.token_client().balance(&ctx.o2o), 2_000_000);
     assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
 }
 
 // --- Step 5: Traveller cancellation ---
@@ -934,6 +909,10 @@ fn host_cancel_rejects_double_cancellation() {
     ctx.client().cancel_by_host(&booking_id);
 
     assert_eq!(
+        ctx.client().try_cancel_by_host(&booking_id),
+        Err(Ok(Error::AlreadyCancelled))
+    );
+    assert_eq!(
         ctx.client().try_execute_split(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
     );
@@ -1152,4 +1131,258 @@ fn open_dispute_rejects_unauthorized() {
             .try_resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0)
             .is_err()
     );
+}
+
+// --- Push-only accounting & hardening ---
+
+#[test]
+fn total_escrowed_increases_on_lock_decreases_on_settlement() {
+    let ctx = setup();
+    let amount = 100i128;
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+
+    ctx.client().lock_escrow(&booking_id, &amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    ctx.client().check_in(&booking_id);
+    ctx.client().complete(&booking_id);
+    ctx.client().execute_split(&booking_id);
+
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+    assert!(ctx.client().get_booking(&booking_id).settled);
+}
+
+#[test]
+fn traveller_cancel_decreases_total_escrowed() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    ctx.client().cancel_by_traveller(&booking_id);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.client().get_booking(&booking_id).escrow_amount, 0);
+}
+
+#[test]
+fn host_cancel_decreases_total_escrowed_and_pushes_refund() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    ctx.client().cancel_by_host(&booking_id);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.ops),
+        DEFAULT_HOST_CANCEL_FEE
+    );
+}
+
+#[test]
+fn dispute_settlement_decreases_total_escrowed() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    ctx.client()
+        .resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount);
+}
+
+#[test]
+fn multiple_bookings_escrow_isolation() {
+    let ctx = setup();
+    let amount_a = 100i128;
+    let amount_b = 200i128;
+
+    let id_a = ctx.fund_and_book(amount_a, 1_000_000);
+    let id_b = ctx.fund_and_book(amount_b, 2_000_000);
+    ctx.client().lock_escrow(&id_a, &amount_a);
+    ctx.client().lock_escrow(&id_b, &amount_b);
+
+    assert_eq!(ctx.client().get_total_escrowed(), amount_a + amount_b);
+    assert_eq!(
+        ctx.token_client().balance(&ctx.contract_id),
+        amount_a + amount_b
+    );
+
+    ctx.client().check_in(&id_a);
+    ctx.client().complete(&id_a);
+    ctx.client().execute_split(&id_a);
+
+    // Settling A must not touch B's escrow.
+    assert_eq!(ctx.client().get_total_escrowed(), amount_b);
+    assert_eq!(ctx.client().get_booking(&id_b).escrow_amount, amount_b);
+    assert!(!ctx.client().get_booking(&id_b).settled);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount_b);
+
+    ctx.client().check_in(&id_b);
+    ctx.client().complete(&id_b);
+    ctx.client().execute_split(&id_b);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+}
+
+#[test]
+fn unsolicited_usdc_does_not_modify_total_escrowed() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    // Extra tokens sent to the contract outside lock_escrow.
+    let extra = 50i128;
+    ctx.mint(&ctx.stello, extra);
+    ctx.token_client()
+        .transfer(&ctx.stello, &ctx.contract_id, &extra);
+
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount + extra);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    ctx.client().check_in(&booking_id);
+    ctx.client().complete(&booking_id);
+    ctx.client().execute_split(&booking_id);
+
+    // Settlement only spends booking escrow; leftover unsolicited remains.
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), extra);
+}
+
+#[test]
+fn insufficient_contract_balance_causes_settlement_failure() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+
+    // Inflate accounted escrow above token balance to trip solvency check.
+    ctx.env.as_contract(&ctx.contract_id, || {
+        crate::storage::set_total_escrowed(&ctx.env, amount + 1);
+    });
+
+    assert_eq!(
+        ctx.client().try_execute_split(&booking_id),
+        Err(Ok(Error::Insolvent))
+    );
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert!(!b.settled);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+}
+
+#[test]
+fn host_cancel_insufficient_fee_leaves_total_escrowed_unchanged() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE - 1);
+
+    assert!(ctx.client().try_cancel_by_host(&booking_id).is_err());
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+    assert!(!ctx.client().get_booking(&booking_id).settled);
+}
+
+#[test]
+fn book_rejects_start_time_in_the_past() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 1_000);
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.host, &100i128, &1_000u64),
+        Err(Ok(Error::InvalidStartTime))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.host, &100i128, &999u64),
+        Err(Ok(Error::InvalidStartTime))
+    );
+}
+
+#[test]
+fn update_booking_rejects_invalid_start_time() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 500);
+    let booking_id = ctx
+        .client()
+        .book(&ctx.traveller, &ctx.host, &100i128, &1_000u64);
+
+    assert_eq!(
+        ctx.client()
+            .try_update_booking(&booking_id, &ctx.host, &100i128, &500u64),
+        Err(Ok(Error::InvalidStartTime))
+    );
+}
+
+#[test]
+fn start_time_cannot_change_after_escrowed() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id, &amount);
+
+    assert_eq!(
+        ctx.client()
+            .try_update_booking(&booking_id, &ctx.host, &amount, &9_000_000),
+        Err(Ok(Error::InvalidUpdate))
+    );
+    assert_eq!(ctx.client().get_booking(&booking_id).start_time, 1_000_000);
+}
+
+#[test]
+fn initialize_rejects_non_positive_host_cancel_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stello = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let cfg = Config {
+        stello_wallet: stello.clone(),
+        token: token.clone(),
+        ops_pool: Address::generate(&env),
+        review_pool: Address::generate(&env),
+        qa_pool: Address::generate(&env),
+        o2o_pool: Address::generate(&env),
+        host_cancel_fee: 0,
+    };
+    assert_eq!(client.try_initialize(&cfg), Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn initialize_rejects_duplicate_pool_addresses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let stello = Address::generate(&env);
+    let shared = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let contract_id = env.register(StelloBookingContract, ());
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let cfg = Config {
+        stello_wallet: stello,
+        token,
+        ops_pool: shared.clone(),
+        review_pool: shared,
+        qa_pool: Address::generate(&env),
+        o2o_pool: Address::generate(&env),
+        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
+    };
+    assert_eq!(client.try_initialize(&cfg), Err(Ok(Error::InvalidAddress)));
 }
