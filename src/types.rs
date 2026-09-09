@@ -101,16 +101,10 @@ pub struct SettlementAmounts {
 pub enum SettlementType {
     Completed = 0,
     TravellerCancel = 1,
+    /// Escrow-only settlement. The Host→Ops `$5` fee is **not** included here;
+    /// see `HostCancellationFeePaid`.
     HostCancel = 2,
     Dispute = 3,
-}
-
-/// One dispute payout share (BPS of escrow).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DisputeShare {
-    pub recipient: Address,
-    pub bps: u32,
 }
 
 /// Revenue split basis points (must sum to BPS_DENOM).

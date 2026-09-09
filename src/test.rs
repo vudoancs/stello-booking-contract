@@ -1,14 +1,20 @@
 #![cfg(test)]
-//! Lifecycle, escrow, settlement, and traveller-cancellation tests.
+//! Lifecycle, escrow, settlement, TTL, constructor, auth, and atomicity tests.
 use soroban_sdk::{
     Address, Env, IntoVal,
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{
+        Address as _, Ledger, MockAuth, MockAuthInvoke,
+        storage::{Instance as _, Persistent as _},
+    },
     token,
 };
 
 use crate::{
-    BookingState, Config, DEFAULT_HOST_CANCEL_FEE, Error, FOUR_WEEKS, StelloBookingContract,
+    BookingState, DEFAULT_HOST_CANCEL_FEE, Error, FOUR_WEEKS, INSTANCE_TTL_EXTEND_TO,
+    PERSISTENT_BOOKING_TTL_EXTEND_TO, PERSISTENT_SETTLEMENT_TTL_EXTEND_TO, StelloBookingContract,
     StelloBookingContractClient, TWO_WEEKS,
+    storage::DataKey,
+    test_token::{ScriptedToken, ScriptedTokenClient},
 };
 
 struct TestCtx {
@@ -64,6 +70,30 @@ impl TestCtx {
     }
 }
 
+fn register_contract(
+    env: &Env,
+    stello: &Address,
+    token: &Address,
+    ops: &Address,
+    review: &Address,
+    qa: &Address,
+    o2o: &Address,
+    host_cancel_fee: i128,
+) -> Address {
+    env.register(
+        StelloBookingContract,
+        (
+            stello.clone(),
+            token.clone(),
+            ops.clone(),
+            review.clone(),
+            qa.clone(),
+            o2o.clone(),
+            host_cancel_fee,
+        ),
+    )
+}
+
 fn setup() -> TestCtx {
     let env = Env::default();
     env.mock_all_auths();
@@ -80,19 +110,16 @@ fn setup() -> TestCtx {
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let token = sac.address();
 
-    let contract_id = env.register(StelloBookingContract, ());
-    let client = StelloBookingContractClient::new(&env, &contract_id);
-
-    let cfg = Config {
-        stello_wallet: stello.clone(),
-        token: token.clone(),
-        ops_pool: ops.clone(),
-        review_pool: review.clone(),
-        qa_pool: qa.clone(),
-        o2o_pool: o2o.clone(),
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    };
-    client.initialize(&cfg);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
 
     TestCtx {
         env,
@@ -109,24 +136,17 @@ fn setup() -> TestCtx {
 }
 
 #[test]
-fn initialize_once() {
+fn constructor_sets_config_atomically() {
     let ctx = setup();
     let got = ctx.client().get_config();
     assert_eq!(got.stello_wallet, ctx.stello);
-
-    let cfg = Config {
-        stello_wallet: ctx.stello.clone(),
-        token: ctx.token.clone(),
-        ops_pool: ctx.ops.clone(),
-        review_pool: ctx.review.clone(),
-        qa_pool: ctx.qa.clone(),
-        o2o_pool: ctx.o2o.clone(),
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    };
-    assert_eq!(
-        ctx.client().try_initialize(&cfg),
-        Err(Ok(Error::AlreadyInitialized))
-    );
+    assert_eq!(got.token, ctx.token);
+    assert_eq!(got.ops_pool, ctx.ops);
+    assert_eq!(got.review_pool, ctx.review);
+    assert_eq!(got.qa_pool, ctx.qa);
+    assert_eq!(got.o2o_pool, ctx.o2o);
+    assert_eq!(got.host_cancel_fee, DEFAULT_HOST_CANCEL_FEE);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
 }
 
 #[test]
@@ -241,7 +261,7 @@ fn escrow_rejects_zero_amount() {
 #[test]
 fn escrow_rejects_unauthorized_caller() {
     let env = Env::default();
-    // Do not mock_all_auths — only authorize initialize + book + traveller path partially.
+    env.mock_all_auths();
 
     let stello = Address::generate(&env);
     let traveller = Address::generate(&env);
@@ -252,46 +272,22 @@ fn escrow_rejects_unauthorized_caller() {
     let o2o = Address::generate(&env);
 
     let issuer = Address::generate(&env);
-    let sac = env.register_stellar_asset_contract_v2(issuer.clone());
+    let sac = env.register_stellar_asset_contract_v2(issuer);
     let token = sac.address();
     let sac_admin = token::StellarAssetClient::new(&env, &token);
-    let contract_id = env.register(StelloBookingContract, ());
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
     let client = StelloBookingContractClient::new(&env, &contract_id);
 
-    let cfg = Config {
-        stello_wallet: stello.clone(),
-        token: token.clone(),
-        ops_pool: ops,
-        review_pool: review,
-        qa_pool: qa,
-        o2o_pool: o2o,
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    };
-
-    env.mock_auths(&[MockAuth {
-        address: &stello,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "initialize",
-            args: (cfg.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    client.initialize(&cfg);
-
     let amount = 100i128;
-    env.mock_auths(&[MockAuth {
-        address: &stello,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "book",
-            args: (traveller.clone(), host.clone(), amount, 1_000_000u64).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    // Mint needs issuer/admin auth — use mock_all briefly for mint only via StellarAssetClient.
-    // StellarAssetClient mint with mock_all is easier:
-    env.mock_all_auths();
     sac_admin.mint(&traveller, &amount);
     let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
 
@@ -731,19 +727,17 @@ fn traveller_cancel_rejects_unauthorized_caller() {
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let token = sac.address();
     let sac_admin = token::StellarAssetClient::new(&env, &token);
-    let contract_id = env.register(StelloBookingContract, ());
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
     let client = StelloBookingContractClient::new(&env, &contract_id);
-
-    let cfg = Config {
-        stello_wallet: stello.clone(),
-        token: token.clone(),
-        ops_pool: ops,
-        review_pool: review,
-        qa_pool: qa,
-        o2o_pool: o2o,
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    };
-    client.initialize(&cfg);
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
@@ -872,18 +866,17 @@ fn host_cancel_rejects_non_host_without_auth() {
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let token = sac.address();
     let sac_admin = token::StellarAssetClient::new(&env, &token);
-    let contract_id = env.register(StelloBookingContract, ());
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
     let client = StelloBookingContractClient::new(&env, &contract_id);
-
-    client.initialize(&Config {
-        stello_wallet: stello,
-        token: token.clone(),
-        ops_pool: ops.clone(),
-        review_pool: review,
-        qa_pool: qa,
-        o2o_pool: o2o,
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    });
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
@@ -1082,7 +1075,9 @@ fn open_dispute_rejects_invalid_state() {
         Err(Ok(Error::InvalidStateTransition))
     );
 
-    let booking_id = ctx.reach_completed(amount);
+    // CheckedIn (not Escrowed/Completed) cannot open dispute.
+    ctx.client().lock_escrow(&booking_id, &amount);
+    ctx.client().check_in(&booking_id);
     assert_eq!(
         ctx.client().try_open_dispute(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
@@ -1106,18 +1101,17 @@ fn open_dispute_rejects_unauthorized() {
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let token = sac.address();
     let sac_admin = token::StellarAssetClient::new(&env, &token);
-    let contract_id = env.register(StelloBookingContract, ());
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
     let client = StelloBookingContractClient::new(&env, &contract_id);
-
-    client.initialize(&Config {
-        stello_wallet: stello,
-        token: token.clone(),
-        ops_pool: ops,
-        review_pool: review,
-        qa_pool: qa,
-        o2o_pool: o2o,
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    });
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
@@ -1341,30 +1335,29 @@ fn start_time_cannot_change_after_escrowed() {
 }
 
 #[test]
-fn initialize_rejects_non_positive_host_cancel_fee() {
+#[should_panic(expected = "Error(Contract, #6)")]
+fn constructor_rejects_non_positive_host_cancel_fee() {
     let env = Env::default();
     env.mock_all_auths();
     let stello = Address::generate(&env);
     let token = env
         .register_stellar_asset_contract_v2(Address::generate(&env))
         .address();
-    let contract_id = env.register(StelloBookingContract, ());
-    let client = StelloBookingContractClient::new(&env, &contract_id);
-
-    let cfg = Config {
-        stello_wallet: stello.clone(),
-        token: token.clone(),
-        ops_pool: Address::generate(&env),
-        review_pool: Address::generate(&env),
-        qa_pool: Address::generate(&env),
-        o2o_pool: Address::generate(&env),
-        host_cancel_fee: 0,
-    };
-    assert_eq!(client.try_initialize(&cfg), Err(Ok(Error::InvalidAmount)));
+    let _ = register_contract(
+        &env,
+        &stello,
+        &token,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        0,
+    );
 }
 
 #[test]
-fn initialize_rejects_duplicate_pool_addresses() {
+#[should_panic(expected = "Error(Contract, #7)")]
+fn constructor_rejects_duplicate_pool_addresses() {
     let env = Env::default();
     env.mock_all_auths();
     let stello = Address::generate(&env);
@@ -1372,17 +1365,511 @@ fn initialize_rejects_duplicate_pool_addresses() {
     let token = env
         .register_stellar_asset_contract_v2(Address::generate(&env))
         .address();
-    let contract_id = env.register(StelloBookingContract, ());
+    let _ = register_contract(
+        &env,
+        &stello,
+        &token,
+        &shared,
+        &shared,
+        &Address::generate(&env),
+        &Address::generate(&env),
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+}
+
+// --- TTL (testutils get_ttl; not a full network archival simulation) ---
+//
+// Limitation: Protocol 23+ test envs auto-restore archived persistent/instance
+// entries on access, so we do not assert hard archival failures. We verify
+// extend_ttl targets via get_ttl and that reads succeed after advancing the
+// ledger sequence within the extended TTL window.
+
+#[test]
+fn ttl_extended_on_booking_and_instance() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let booking_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Booking(booking_id));
+        assert_eq!(booking_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+
+        let instance_ttl = ctx.env.storage().instance().get_ttl();
+        assert_eq!(instance_ttl, INSTANCE_TTL_EXTEND_TO);
+    });
+
+    // Advance within extended TTL — booking + config + accounting still readable.
+    let seq = ctx.env.ledger().sequence();
+    ctx.env.ledger().set_sequence_number(seq + 10_000);
+
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.booking_id, booking_id);
+    assert_eq!(ctx.client().get_config().stello_wallet, ctx.stello);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+
+    ctx.client().lock_escrow(&booking_id, &amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+}
+
+#[test]
+fn ttl_extended_on_cancel_settlement() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+    ctx.client().cancel_by_traveller(&booking_id);
+
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::CancelSettlement(booking_id));
+        assert_eq!(ttl, PERSISTENT_SETTLEMENT_TTL_EXTEND_TO);
+    });
+
+    let seq = ctx.env.ledger().sequence();
+    ctx.env.ledger().set_sequence_number(seq + 5_000);
+    let s = ctx.client().get_cancel_settlement(&booking_id);
+    assert_eq!(s.traveller_amount, 70);
+}
+
+// --- State-machine regression ---
+
+#[test]
+fn cancel_by_host_while_disputed_fails() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
+    ctx.client().open_dispute(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_cancel_by_host(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+    assert_eq!(
+        ctx.client().get_booking(&booking_id).state,
+        BookingState::Disputed
+    );
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+}
+
+#[test]
+fn open_dispute_after_cancellation_fails() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+    ctx.client().cancel_by_traveller(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_open_dispute(&booking_id),
+        Err(Ok(Error::AlreadySettled))
+    );
+}
+
+#[test]
+fn cancel_by_traveller_after_open_dispute_fails() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_escrowed(amount, 1_000_000);
+    ctx.client().open_dispute(&booking_id);
+
+    assert_eq!(
+        ctx.client().try_cancel_by_traveller(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn update_booking_rejects_traveller_equals_host() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    assert_eq!(
+        ctx.client()
+            .try_update_booking(&booking_id, &ctx.traveller, &amount, &2_000_000u64),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+// --- Failed push recovery (Completed → Disputed) ---
+
+#[test]
+fn failed_execute_split_leaves_completed_unsettled_then_dispute_recovers() {
+    // Limitation: SAC testutils cannot model classic trustline rejects.
+    // ScriptedToken refuses the last completion recipient (o2o) to force late failure.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let token = env.register(ScriptedToken, ());
+    let tok = ScriptedTokenClient::new(&env, &token);
+
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
     let client = StelloBookingContractClient::new(&env, &contract_id);
 
-    let cfg = Config {
-        stello_wallet: stello,
-        token,
-        ops_pool: shared.clone(),
-        review_pool: shared,
-        qa_pool: Address::generate(&env),
-        o2o_pool: Address::generate(&env),
-        host_cancel_fee: DEFAULT_HOST_CANCEL_FEE,
-    };
-    assert_eq!(client.try_initialize(&cfg), Err(Ok(Error::InvalidAddress)));
+    let amount = 100i128;
+    tok.mint(&traveller, &amount);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    client.lock_escrow(&booking_id, &amount);
+    client.check_in(&booking_id);
+    client.complete(&booking_id);
+
+    assert_eq!(client.get_total_escrowed(), amount);
+    assert_eq!(tok.balance(&contract_id), amount);
+
+    // Fail on the last push recipient (o2o) after earlier shares would succeed.
+    tok.arm_fail_to(&o2o);
+    assert!(
+        client.try_execute_split(&booking_id).is_err(),
+        "expected late o2o transfer failure"
+    );
+
+    let b = client.get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Completed);
+    assert!(!b.settled);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(client.get_total_escrowed(), amount);
+    // No partial payouts retained.
+    assert_eq!(tok.balance(&contract_id), amount);
+    assert_eq!(tok.balance(&host), 0);
+    assert_eq!(tok.balance(&ops), 0);
+    assert_eq!(tok.balance(&review), 0);
+    assert_eq!(tok.balance(&qa), 0);
+    assert_eq!(tok.balance(&o2o), 0);
+
+    // Recovery: open dispute from Completed + unsettled.
+    client.open_dispute(&booking_id);
+    assert_eq!(
+        client.get_booking(&booking_id).state,
+        BookingState::Disputed
+    );
+
+    tok.disarm();
+    let settlement = client.resolve_dispute(&booking_id, &10000, &0, &0, &0, &0, &0);
+    assert_eq!(settlement.traveller_amount, amount);
+    assert!(client.get_booking(&booking_id).settled);
+    assert_eq!(client.get_booking(&booking_id).escrow_amount, 0);
+    assert_eq!(client.get_total_escrowed(), 0);
+    assert_eq!(tok.balance(&traveller), amount);
+}
+
+#[test]
+fn open_dispute_rejected_after_successful_settlement() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+    ctx.client().execute_split(&booking_id);
+    assert_eq!(
+        ctx.client().try_open_dispute(&booking_id),
+        Err(Ok(Error::AlreadySettled))
+    );
+}
+
+#[test]
+fn open_dispute_allowed_for_completed_unsettled() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.reach_completed(amount);
+    assert!(!ctx.client().get_booking(&booking_id).settled);
+    ctx.client().open_dispute(&booking_id);
+    assert_eq!(
+        ctx.client().get_booking(&booking_id).state,
+        BookingState::Disputed
+    );
+}
+
+// --- Address collision hardening ---
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn constructor_rejects_ops_pool_equals_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = Address::generate(&env);
+    let stello = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register_at(
+        &contract_id,
+        StelloBookingContract,
+        (
+            stello,
+            token,
+            contract_id.clone(), // ops_pool == contract
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            DEFAULT_HOST_CANCEL_FEE,
+        ),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn constructor_rejects_stello_equals_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    env.register_at(
+        &contract_id,
+        StelloBookingContract,
+        (
+            contract_id.clone(),
+            token,
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            DEFAULT_HOST_CANCEL_FEE,
+        ),
+    );
+}
+
+#[test]
+fn book_rejects_traveller_or_host_equals_contract() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.contract_id, &ctx.host, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.contract_id, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn book_rejects_host_equals_ops_pool() {
+    let ctx = setup();
+    // Host == ops would make host-cancel fee an economic no-op.
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.ops, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn book_rejects_party_equals_payout_sink() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.review, &ctx.host, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.qa, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.o2o, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.stello, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn book_rejects_traveller_or_host_equals_token() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.token, &ctx.host, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.token, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn update_booking_rejects_host_equals_ops() {
+    let ctx = setup();
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+    assert_eq!(
+        ctx.client()
+            .try_update_booking(&booking_id, &ctx.ops, &100i128, &2_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+// --- Auth without exclusive reliance on silent success ---
+
+#[test]
+fn stello_auth_required_for_book_recorded() {
+    let ctx = setup();
+    let _ = ctx
+        .client()
+        .book(&ctx.traveller, &ctx.host, &100i128, &1_000_000u64);
+    let auths = ctx.env.auths();
+    assert!(
+        auths.iter().any(|(addr, _)| *addr == ctx.stello),
+        "expected stello auth on book; got {:?}",
+        auths.len()
+    );
+}
+
+#[test]
+fn stello_cannot_impersonate_host_for_cancel() {
+    let env = Env::default();
+    // Authorize only Stello — not the host — for cancel_by_host.
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    env.mock_all_auths();
+    let issuer = Address::generate(&env);
+    let sac = env.register_stellar_asset_contract_v2(issuer);
+    let token = sac.address();
+    let sac_admin = token::StellarAssetClient::new(&env, &token);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+    let amount = 100i128;
+    sac_admin.mint(&traveller, &amount);
+    sac_admin.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    client.lock_escrow(&booking_id, &amount);
+
+    // Only mock Stello for cancel_by_host — host.require_auth must still fail.
+    env.set_auths(&[]);
+    env.mock_auths(&[MockAuth {
+        address: &stello,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "cancel_by_host",
+            args: (booking_id,).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(
+        client.try_cancel_by_host(&booking_id).is_err(),
+        "Stello must not impersonate Host"
+    );
+    let b = client.get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert!(!b.settled);
+}
+
+#[test]
+fn host_cancel_late_escrow_refund_failure_rolls_back_fee() {
+    // Fee transfer (host→ops) would succeed; traveller escrow refund fails afterward.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let stello = Address::generate(&env);
+    let traveller = Address::generate(&env);
+    let host = Address::generate(&env);
+    let ops = Address::generate(&env);
+    let review = Address::generate(&env);
+    let qa = Address::generate(&env);
+    let o2o = Address::generate(&env);
+
+    let token = env.register(ScriptedToken, ());
+    let tok = ScriptedTokenClient::new(&env, &token);
+    let contract_id = register_contract(
+        &env,
+        &stello,
+        &token,
+        &ops,
+        &review,
+        &qa,
+        &o2o,
+        DEFAULT_HOST_CANCEL_FEE,
+    );
+    let client = StelloBookingContractClient::new(&env, &contract_id);
+
+    let amount = 100i128;
+    tok.mint(&traveller, &amount);
+    tok.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
+    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    client.lock_escrow(&booking_id, &amount);
+
+    tok.arm_fail_to(&traveller);
+    assert!(client.try_cancel_by_host(&booking_id).is_err());
+
+    let b = client.get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert!(!b.settled);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(client.get_total_escrowed(), amount);
+    // Host fee not lost; escrow intact.
+    assert_eq!(tok.balance(&host), DEFAULT_HOST_CANCEL_FEE);
+    assert_eq!(tok.balance(&ops), 0);
+    assert_eq!(tok.balance(&contract_id), amount);
+    assert_eq!(tok.balance(&traveller), 0);
+}
+
+#[test]
+fn instance_ttl_bumped_on_booking_activity() {
+    let ctx = setup();
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+
+    // Drop remaining TTL below INSTANCE_TTL_THRESHOLD so the next active read extends.
+    let seq = ctx.env.ledger().sequence();
+    ctx.env
+        .ledger()
+        .set_sequence_number(seq + INSTANCE_TTL_EXTEND_TO - 10_000);
+
+    let _ = ctx.client().get_booking(&booking_id);
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let instance_ttl = ctx.env.storage().instance().get_ttl();
+        assert_eq!(instance_ttl, INSTANCE_TTL_EXTEND_TO);
+        let booking_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Booking(booking_id));
+        assert_eq!(booking_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+    });
+    // Limitation: testutils auto-restore archived entries (Protocol 23+); we assert
+    // extend_ttl targets via get_ttl, not irreversible network archival.
 }
