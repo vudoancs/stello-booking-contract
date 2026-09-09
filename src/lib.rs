@@ -5,9 +5,9 @@
 //!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
-//!   `execute_split`, `cancel_by_traveller`.
+//!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`.
 //! - **Host wallet:** `cancel_by_host` (authorizes $5 fee from host, not escrow).
-//! - Dispute is deferred to a later step.
+//! - Stello Wallet is the sole dispute-resolution authority (MVP; no DAO/multisig).
 
 mod errors;
 mod events;
@@ -28,8 +28,8 @@ pub use types::*;
 
 use events::{
     BookingCancelled, BookingCheckedIn, BookingCompleted, BookingCreated, BookingUpdated,
-    CancelSettlementExecuted, EscrowLocked, HostCancellationFeePaid, PayoutClaimed,
-    SettlementExecuted,
+    CancelSettlementExecuted, DisputeOpened, DisputeResolved, EscrowLocked,
+    HostCancellationFeePaid, PayoutClaimed, SettlementExecuted,
 };
 use storage::{
     get_cancel_settlement as load_cancel_settlement, get_claimable, get_config, next_booking_id,
@@ -485,6 +485,159 @@ impl StelloBookingContract {
         .publish(&env);
 
         Ok(settlement)
+    }
+
+    /// Open a dispute while `Escrowed`. Freezes escrow (no fund release). **Auth:** Stello.
+    pub fn open_dispute(env: Env, booking_id: u64) -> Result<(), Error> {
+        let config = require_config(&env)?;
+        require_stello(&config);
+        let mut booking = require_booking(&env, booking_id)?;
+
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
+        if booking.state != BookingState::Escrowed {
+            return Err(Error::InvalidStateTransition);
+        }
+        validate_transition(booking.state, BookingState::Disputed)?;
+        if booking.escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        booking.state = BookingState::Disputed;
+        set_booking(&env, &booking);
+
+        DisputeOpened { booking_id }.publish(&env);
+        Ok(())
+    }
+
+    /// Resolve a dispute with custom BPS allocation (must sum to 10_000).
+    /// Pushes escrow atomically to traveller/host/ops/review/qa/o2o. **Auth:** Stello.
+    pub fn resolve_dispute(
+        env: Env,
+        booking_id: u64,
+        traveller_bps: u32,
+        host_bps: u32,
+        ops_bps: u32,
+        review_bps: u32,
+        qa_bps: u32,
+        o2o_bps: u32,
+    ) -> Result<SettlementAmounts, Error> {
+        let config = require_config(&env)?;
+        require_stello(&config);
+        let mut booking = require_booking(&env, booking_id)?;
+
+        if booking.state != BookingState::Disputed {
+            return Err(Error::InvalidDispute);
+        }
+        if booking.settled {
+            return Err(Error::AlreadySettled);
+        }
+        validate_transition(booking.state, BookingState::Completed)?;
+        if booking.escrow_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let bps_sum = traveller_bps
+            .checked_add(host_bps)
+            .and_then(|v| v.checked_add(ops_bps))
+            .and_then(|v| v.checked_add(review_bps))
+            .and_then(|v| v.checked_add(qa_bps))
+            .and_then(|v| v.checked_add(o2o_bps))
+            .ok_or(Error::InvalidBpsAllocation)?;
+        if bps_sum != BPS_DENOM {
+            return Err(Error::InvalidBpsAllocation);
+        }
+
+        let escrow = booking.escrow_amount;
+        let bps_list = [
+            traveller_bps,
+            host_bps,
+            ops_bps,
+            review_bps,
+            qa_bps,
+            o2o_bps,
+        ];
+        let mut amounts = [0i128; 6];
+        compute_bps_amounts(escrow, &bps_list, &mut amounts)?;
+
+        let traveller_amount = amounts[0];
+        let host_amount = amounts[1];
+        let ops_amount = amounts[2];
+        let review_amount = amounts[3];
+        let qa_amount = amounts[4];
+        let o2o_amount = amounts[5];
+
+        let total = traveller_amount
+            .checked_add(host_amount)
+            .and_then(|v| v.checked_add(ops_amount))
+            .and_then(|v| v.checked_add(review_amount))
+            .and_then(|v| v.checked_add(qa_amount))
+            .and_then(|v| v.checked_add(o2o_amount))
+            .ok_or(Error::MathError)?;
+        if total != escrow {
+            return Err(Error::MathError);
+        }
+        if traveller_amount > escrow
+            || host_amount > escrow
+            || ops_amount > escrow
+            || review_amount > escrow
+            || qa_amount > escrow
+            || o2o_amount > escrow
+        {
+            return Err(Error::EscrowExceedsAmount);
+        }
+
+        // Effects (CEI): settle + move to Completed, then push all shares.
+        booking.state = BookingState::Completed;
+        booking.settled = true;
+        booking.escrow_amount = 0;
+        set_booking(&env, &booking);
+
+        let contract = env.current_contract_address();
+        let token_client = token::TokenClient::new(&env, &config.token);
+        transfer_from_contract(
+            &token_client,
+            &contract,
+            &booking.traveller,
+            traveller_amount,
+        );
+        transfer_from_contract(&token_client, &contract, &booking.host, host_amount);
+        transfer_from_contract(&token_client, &contract, &config.ops_pool, ops_amount);
+        transfer_from_contract(&token_client, &contract, &config.review_pool, review_amount);
+        transfer_from_contract(&token_client, &contract, &config.qa_pool, qa_amount);
+        transfer_from_contract(&token_client, &contract, &config.o2o_pool, o2o_amount);
+
+        DisputeResolved {
+            booking_id,
+            traveller_bps,
+            host_bps,
+            ops_bps,
+            review_bps,
+            qa_bps,
+            o2o_bps,
+        }
+        .publish(&env);
+
+        let settlement_event = SettlementExecuted {
+            booking_id,
+            traveller_amount,
+            host_amount,
+            ops_amount,
+            review_amount,
+            qa_amount,
+            o2o_amount,
+        };
+        settlement_event.publish(&env);
+
+        Ok(SettlementAmounts {
+            traveller_amount,
+            host_amount,
+            ops_amount,
+            review_amount,
+            qa_amount,
+            o2o_amount,
+        })
     }
 
     /// Withdraw claimable USDC (if any). **Auth:** claimant.

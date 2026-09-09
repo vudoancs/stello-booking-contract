@@ -82,6 +82,18 @@ pub struct SplitAmounts {
     pub o2o_amount: i128,
 }
 
+/// Full multi-party settlement amounts (completion or dispute).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementAmounts {
+    pub traveller_amount: i128,
+    pub host_amount: i128,
+    pub ops_amount: i128,
+    pub review_amount: i128,
+    pub qa_amount: i128,
+    pub o2o_amount: i128,
+}
+
 /// One dispute payout share (BPS of escrow).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

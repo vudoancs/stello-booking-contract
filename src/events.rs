@@ -54,6 +54,7 @@ pub struct BookingCompleted {
 pub struct SettlementExecuted {
     #[topic]
     pub booking_id: u64,
+    pub traveller_amount: i128,
     pub host_amount: i128,
     pub ops_amount: i128,
     pub review_amount: i128,
@@ -65,6 +66,7 @@ impl SettlementExecuted {
     pub fn from_split(booking_id: u64, split: &SplitAmounts) -> Self {
         Self {
             booking_id,
+            traveller_amount: 0,
             host_amount: split.host_amount,
             ops_amount: split.ops_amount,
             review_amount: split.review_amount,
@@ -112,4 +114,24 @@ pub struct HostCancellationFeePaid {
     pub host: Address,
     pub ops: Address,
     pub amount: i128,
+}
+
+#[contractevent(topics = ["dispute", "opened"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOpened {
+    #[topic]
+    pub booking_id: u64,
+}
+
+#[contractevent(topics = ["dispute", "resolved"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolved {
+    #[topic]
+    pub booking_id: u64,
+    pub traveller_bps: u32,
+    pub host_bps: u32,
+    pub ops_bps: u32,
+    pub review_bps: u32,
+    pub qa_bps: u32,
+    pub o2o_bps: u32,
 }
