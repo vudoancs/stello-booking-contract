@@ -135,10 +135,7 @@ mod tests {
         for amount in [1i128, 3, 7, 50, 99, 100, 10_000] {
             for &delta in &[0u64, TWO_WEEKS - 1, TWO_WEEKS, FOUR_WEEKS - 1, FOUR_WEEKS] {
                 let s = compute_refund(amount, delta, 0, CancelledBy::Traveller).unwrap();
-                assert_eq!(
-                    s.traveller_amount + s.host_amount + s.ops_amount,
-                    amount
-                );
+                assert_eq!(s.traveller_amount + s.host_amount + s.ops_amount, amount);
             }
         }
     }

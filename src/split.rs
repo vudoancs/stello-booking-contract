@@ -3,9 +3,7 @@
 //! Remainder after flooring each share is assigned to the host so that
 //! `host + ops + review + qa + o2o == amount` exactly.
 use crate::errors::Error;
-use crate::types::{
-    SplitAmounts, BPS_DENOM, HOST_BPS, O2O_BPS, OPS_BPS, QA_BPS, REVIEW_BPS,
-};
+use crate::types::{BPS_DENOM, HOST_BPS, O2O_BPS, OPS_BPS, QA_BPS, REVIEW_BPS, SplitAmounts};
 
 pub(crate) fn bps_floor(amount: i128, bps: u32) -> Result<i128, Error> {
     let bps_i = i128::from(bps);
@@ -36,9 +34,7 @@ pub fn compute_completion_split(amount: i128) -> Result<SplitAmounts, Error> {
         .ok_or(Error::MathError)?;
 
     let remainder = amount.checked_sub(sum).ok_or(Error::MathError)?;
-    host_amount = host_amount
-        .checked_add(remainder)
-        .ok_or(Error::MathError)?;
+    host_amount = host_amount.checked_add(remainder).ok_or(Error::MathError)?;
 
     let total = host_amount
         .checked_add(ops_amount)
