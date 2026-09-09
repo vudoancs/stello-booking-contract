@@ -1,1 +1,7 @@
 /target
+
+# Generated provenance (e.g. deployment/testnet.json) is produced by the
+# Deploy Testnet workflow, uploaded as a GitHub Actions artifact and Release
+# asset, and is NOT required in git. Ignoring /deployment/ avoids dirty trees
+# from local/manual deploy runs while keeping the repo free of generated IDs.
+/deployment/
