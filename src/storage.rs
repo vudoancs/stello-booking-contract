@@ -1,5 +1,5 @@
 //! Storage keys and helpers.
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::{Env, contracttype};
 
 use crate::errors::Error;
 use crate::types::{Booking, Config};

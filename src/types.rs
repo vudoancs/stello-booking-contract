@@ -1,16 +1,17 @@
 //! Core types for Stello booking / escrow / settlement contract.
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{Address, contracttype};
 
-/// Booking lifecycle states (no check-in / SBT in this contract).
+/// Booking lifecycle states.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum BookingState {
     Created = 0,
     Escrowed = 1,
-    Completed = 2,
-    Cancelled = 3,
-    Disputed = 4,
+    CheckedIn = 2,
+    Completed = 3,
+    Cancelled = 4,
+    Disputed = 5,
 }
 
 /// Who initiated cancellation (drives refund policy).
@@ -27,7 +28,7 @@ pub enum CancelledBy {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
-    /// Privileged Stello wallet — create/update/lock/traveller-cancel/complete/dispute.
+    /// Privileged Stello wallet — book/update/lock/check-in/complete (and later cancel/dispute).
     pub stello_wallet: Address,
     /// Stellar Asset Contract for USDC (or test token).
     pub token: Address,
@@ -53,6 +54,7 @@ pub struct Booking {
     pub created_at: u64,
     pub state: BookingState,
     pub escrow_locked: bool,
+    pub checked_in: bool,
     pub settled: bool,
     pub was_cancelled: bool,
     pub cancelled_by: CancelledBy,

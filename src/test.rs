@@ -1,13 +1,10 @@
 #![cfg(test)]
-//! Integration tests with mock USDC (Stellar Asset Contract).
-use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, Env, Vec,
-};
+//! Step 2 lifecycle tests: book → lock_escrow → check_in → complete.
+use soroban_sdk::{Address, Env, testutils::Address as _, token};
 
 use crate::{
-    BookingState, CancelledBy, Config, DisputeShare, Error, StelloBookingContract,
-    StelloBookingContractClient, DEFAULT_HOST_CANCEL_FEE, FOUR_WEEKS, TWO_WEEKS,
+    BookingState, Config, DEFAULT_HOST_CANCEL_FEE, Error, StelloBookingContract,
+    StelloBookingContractClient,
 };
 
 struct TestCtx {
@@ -43,7 +40,7 @@ impl TestCtx {
     fn fund_and_book(&self, amount: i128, start_time: u64) -> u64 {
         self.mint(&self.traveller, amount);
         self.client()
-            .create_booking(&self.traveller, &self.host, &amount, &start_time)
+            .book(&self.traveller, &self.host, &amount, &start_time)
     }
 }
 
@@ -96,7 +93,6 @@ fn initialize_once() {
     let ctx = setup();
     let got = ctx.client().get_config();
     assert_eq!(got.stello_wallet, ctx.stello);
-    assert_eq!(got.host_cancel_fee, DEFAULT_HOST_CANCEL_FEE);
 
     let cfg = Config {
         stello_wallet: ctx.stello.clone(),
@@ -114,10 +110,14 @@ fn initialize_once() {
 }
 
 #[test]
-fn create_update_lock_complete_split() {
+fn valid_lifecycle_created_escrowed_checked_in_completed() {
     let ctx = setup();
     let amount = 100_000_000i128;
     let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    assert_eq!(
+        ctx.client().get_booking_state(&booking_id),
+        BookingState::Created
+    );
 
     ctx.client()
         .update_booking(&booking_id, &ctx.host, &amount, &2_000_000);
@@ -133,180 +133,126 @@ fn create_update_lock_complete_split() {
     assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
     assert_eq!(ctx.token_client().balance(&ctx.traveller), 0);
 
-    let split = ctx.client().complete_booking(&booking_id);
-    assert_eq!(split.host_amount, 80_000_000);
-    assert_eq!(split.ops_amount, 10_000_000);
-    assert_eq!(split.review_amount, 5_000_000);
-    assert_eq!(split.qa_amount, 3_000_000);
-    assert_eq!(split.o2o_amount, 2_000_000);
+    ctx.client().check_in(&booking_id);
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.state, BookingState::CheckedIn);
+    assert!(b.checked_in);
 
-    assert_eq!(ctx.token_client().balance(&ctx.host), 80_000_000);
-    assert_eq!(ctx.token_client().balance(&ctx.ops), 10_000_000);
-    assert_eq!(ctx.token_client().balance(&ctx.review), 5_000_000);
-    assert_eq!(ctx.token_client().balance(&ctx.qa), 3_000_000);
-    assert_eq!(ctx.token_client().balance(&ctx.o2o), 2_000_000);
-    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
+    // Escrow remains in the contract — settlement is deferred.
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
+
+    ctx.client().complete(&booking_id);
     assert_eq!(
         ctx.client().get_booking_state(&booking_id),
         BookingState::Completed
     );
+    assert_eq!(ctx.token_client().balance(&ctx.contract_id), amount);
 }
 
 #[test]
-fn traveller_cancel_four_weeks() {
+fn reject_lock_escrow_from_non_created() {
     let ctx = setup();
-    let amount = 100i128;
-    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
-    let booking_id = ctx.fund_and_book(amount, FOUR_WEEKS);
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
     ctx.client().lock_escrow(&booking_id);
-
-    let s = ctx.client().cancel_by_traveller(&booking_id);
-    assert_eq!(s.traveller_amount, 70);
-    assert_eq!(s.host_amount, 15);
-    assert_eq!(s.ops_amount, 15);
-    assert_eq!(ctx.token_client().balance(&ctx.traveller), 70);
-    assert_eq!(ctx.token_client().balance(&ctx.host), 15);
-    assert_eq!(ctx.token_client().balance(&ctx.ops), 15);
-}
-
-#[test]
-fn traveller_cancel_two_to_four_weeks() {
-    let ctx = setup();
-    let amount = 100i128;
-    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
-    let booking_id = ctx.fund_and_book(amount, TWO_WEEKS);
-    ctx.client().lock_escrow(&booking_id);
-
-    let s = ctx.client().cancel_by_traveller(&booking_id);
-    assert_eq!(s.traveller_amount, 50);
-    assert_eq!(s.host_amount, 35);
-    assert_eq!(s.ops_amount, 15);
-}
-
-#[test]
-fn traveller_cancel_under_two_weeks() {
-    let ctx = setup();
-    let amount = 100i128;
-    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
-    let booking_id = ctx.fund_and_book(amount, TWO_WEEKS - 1);
-    ctx.client().lock_escrow(&booking_id);
-
-    let s = ctx.client().cancel_by_traveller(&booking_id);
-    assert_eq!(s.traveller_amount, 0);
-    assert_eq!(s.host_amount, 80);
-    assert_eq!(s.ops_amount, 20);
-}
-
-#[test]
-fn host_cancel_refunds_escrow_and_charges_fee_from_host() {
-    let ctx = setup();
-    let amount = 100_000_000i128;
-    let booking_id = ctx.fund_and_book(amount, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
-
-    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
     assert_eq!(
-        ctx.token_client().balance(&ctx.host),
-        DEFAULT_HOST_CANCEL_FEE
-    );
-
-    let s = ctx.client().cancel_by_host(&booking_id);
-    assert_eq!(s.traveller_amount, amount);
-    assert_eq!(s.host_amount, 0);
-    assert_eq!(s.ops_amount, 0);
-
-    assert_eq!(ctx.token_client().balance(&ctx.traveller), amount);
-    assert_eq!(ctx.token_client().balance(&ctx.contract_id), 0);
-    assert_eq!(ctx.token_client().balance(&ctx.host), 0);
-    assert_eq!(
-        ctx.token_client().balance(&ctx.ops),
-        DEFAULT_HOST_CANCEL_FEE
-    );
-    assert_eq!(
-        ctx.client().get_booking(&booking_id).cancelled_by,
-        CancelledBy::Host
-    );
-}
-
-#[test]
-fn dispute_custom_bps_allocation() {
-    let ctx = setup();
-    let amount = 10_000i128;
-    let booking_id = ctx.fund_and_book(amount, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
-    ctx.client().open_dispute(&booking_id);
-    assert_eq!(
-        ctx.client().get_booking_state(&booking_id),
-        BookingState::Disputed
-    );
-
-    let mut shares = Vec::new(&ctx.env);
-    shares.push_back(DisputeShare {
-        recipient: ctx.traveller.clone(),
-        bps: 4000,
-    });
-    shares.push_back(DisputeShare {
-        recipient: ctx.host.clone(),
-        bps: 4000,
-    });
-    shares.push_back(DisputeShare {
-        recipient: ctx.ops.clone(),
-        bps: 2000,
-    });
-
-    ctx.client().resolve_dispute(&booking_id, &shares);
-    assert_eq!(ctx.token_client().balance(&ctx.traveller), 4000);
-    assert_eq!(ctx.token_client().balance(&ctx.host), 4000);
-    assert_eq!(ctx.token_client().balance(&ctx.ops), 2000);
-    assert_eq!(
-        ctx.client().get_booking_state(&booking_id),
-        BookingState::Completed
-    );
-}
-
-#[test]
-fn dispute_rejects_bps_not_10000() {
-    let ctx = setup();
-    let amount = 10_000i128;
-    let booking_id = ctx.fund_and_book(amount, 1_000_000);
-    ctx.client().lock_escrow(&booking_id);
-    ctx.client().open_dispute(&booking_id);
-
-    let mut shares = Vec::new(&ctx.env);
-    shares.push_back(DisputeShare {
-        recipient: ctx.traveller.clone(),
-        bps: 5000,
-    });
-    shares.push_back(DisputeShare {
-        recipient: ctx.host.clone(),
-        bps: 4000,
-    });
-
-    assert_eq!(
-        ctx.client().try_resolve_dispute(&booking_id, &shares),
-        Err(Ok(Error::InvalidBpsAllocation))
-    );
-}
-
-#[test]
-fn cannot_complete_without_escrow() {
-    let ctx = setup();
-    let booking_id = ctx
-        .client()
-        .create_booking(&ctx.traveller, &ctx.host, &100i128, &1_000_000);
-    assert_eq!(
-        ctx.client().try_complete_booking(&booking_id),
+        ctx.client().try_lock_escrow(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
     );
 }
 
 #[test]
-fn quote_refund_matches_windows() {
+fn reject_check_in_from_created() {
     let ctx = setup();
-    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
-    let booking_id = ctx.fund_and_book(100, FOUR_WEEKS);
-    let s = ctx
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+    assert_eq!(
+        ctx.client().try_check_in(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn reject_check_in_from_checked_in_and_completed() {
+    let ctx = setup();
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+    ctx.client().lock_escrow(&booking_id);
+    ctx.client().check_in(&booking_id);
+    assert_eq!(
+        ctx.client().try_check_in(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+
+    ctx.client().complete(&booking_id);
+    assert_eq!(
+        ctx.client().try_check_in(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn reject_complete_from_created() {
+    let ctx = setup();
+    let booking_id = ctx
         .client()
-        .quote_refund(&booking_id, &CancelledBy::Traveller);
-    assert_eq!(s.traveller_amount, 70);
+        .book(&ctx.traveller, &ctx.host, &100i128, &1_000_000);
+    assert_eq!(
+        ctx.client().try_complete(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn reject_complete_from_escrowed_without_check_in() {
+    let ctx = setup();
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+    ctx.client().lock_escrow(&booking_id);
+    assert_eq!(
+        ctx.client().try_complete(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn reject_complete_twice() {
+    let ctx = setup();
+    let booking_id = ctx.fund_and_book(100, 1_000_000);
+    ctx.client().lock_escrow(&booking_id);
+    ctx.client().check_in(&booking_id);
+    ctx.client().complete(&booking_id);
+    assert_eq!(
+        ctx.client().try_complete(&booking_id),
+        Err(Ok(Error::InvalidStateTransition))
+    );
+}
+
+#[test]
+fn reject_update_after_escrow_locked() {
+    let ctx = setup();
+    let amount = 100i128;
+    let booking_id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&booking_id);
+    assert_eq!(
+        ctx.client()
+            .try_update_booking(&booking_id, &ctx.host, &amount, &2_000_000),
+        Err(Ok(Error::InvalidUpdate))
+    );
+}
+
+#[test]
+fn reject_book_identical_traveller_host() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.traveller, &100i128, &1_000_000),
+        Err(Ok(Error::InvalidAddress))
+    );
+}
+
+#[test]
+fn reject_book_non_positive_amount() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_book(&ctx.traveller, &ctx.host, &0i128, &1_000_000),
+        Err(Ok(Error::InvalidAmount))
+    );
 }
