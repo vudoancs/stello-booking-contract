@@ -4,6 +4,7 @@
 //! `Created → Escrowed → CheckedIn → Completed`
 //! `Escrowed → Cancelled` (traveller or host cancellation)
 //! `Escrowed → Disputed → Completed` (dispute resolve settles)
+//! `Completed → Disputed` (recovery when push settlement fails; only if unsettled)
 use crate::errors::Error;
 use crate::types::BookingState;
 
@@ -16,6 +17,7 @@ pub fn validate_transition(from: BookingState, to: BookingState) -> Result<(), E
             | (BookingState::CheckedIn, BookingState::Completed)
             | (BookingState::Escrowed, BookingState::Cancelled)
             | (BookingState::Escrowed, BookingState::Disputed)
+            | (BookingState::Completed, BookingState::Disputed)
             | (BookingState::Disputed, BookingState::Completed)
     );
 
@@ -26,6 +28,10 @@ pub fn validate_transition(from: BookingState, to: BookingState) -> Result<(), E
     }
 }
 
+/// Experience/cancel terminal states.
+///
+/// Note: `Completed` may still be **financially unsettled** and eligible for
+/// `open_dispute` recovery before funds are pushed.
 pub fn is_terminal(state: BookingState) -> bool {
     matches!(state, BookingState::Completed | BookingState::Cancelled)
 }
@@ -51,6 +57,7 @@ mod tests {
                 | (BookingState::CheckedIn, BookingState::Completed)
                 | (BookingState::Escrowed, BookingState::Cancelled)
                 | (BookingState::Escrowed, BookingState::Disputed)
+                | (BookingState::Completed, BookingState::Disputed)
                 | (BookingState::Disputed, BookingState::Completed)
         )
     }
@@ -62,6 +69,7 @@ mod tests {
         assert!(validate_transition(BookingState::CheckedIn, BookingState::Completed).is_ok());
         assert!(validate_transition(BookingState::Escrowed, BookingState::Cancelled).is_ok());
         assert!(validate_transition(BookingState::Escrowed, BookingState::Disputed).is_ok());
+        assert!(validate_transition(BookingState::Completed, BookingState::Disputed).is_ok());
         assert!(validate_transition(BookingState::Disputed, BookingState::Completed).is_ok());
     }
 

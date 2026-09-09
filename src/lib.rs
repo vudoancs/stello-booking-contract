@@ -7,6 +7,11 @@
 //! All settlement outcomes transfer escrow **immediately** in the same transaction.
 //! There is no claimable / pull-payment model.
 //!
+//! ## Deployment
+//! Configuration is set atomically via [`StelloBookingContract::__constructor`] at
+//! deploy time. There is no separate `initialize` entrypoint and no post-deploy
+//! uninitialized window.
+//!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `lock_escrow`, `check_in`, `complete`,
 //!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`.
@@ -23,11 +28,18 @@ mod types;
 
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod test_token;
 
 pub use errors::Error;
 pub use refund::compute_refund;
 pub use split::{compute_bps_amounts, compute_completion_split};
 pub use state_machine::{is_terminal, validate_transition};
+pub use storage::{
+    INSTANCE_TTL_EXTEND_TO, INSTANCE_TTL_THRESHOLD, PERSISTENT_BOOKING_TTL_EXTEND_TO,
+    PERSISTENT_BOOKING_TTL_THRESHOLD, PERSISTENT_SETTLEMENT_TTL_EXTEND_TO,
+    PERSISTENT_SETTLEMENT_TTL_THRESHOLD,
+};
 pub use types::*;
 
 use events::{
@@ -35,27 +47,49 @@ use events::{
     DisputeOpened, DisputeResolved, EscrowLocked, HostCancellationFeePaid, SettlementExecuted,
 };
 use storage::{
-    decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement, get_config,
-    get_total_escrowed, increase_total_escrowed, next_booking_id, require_booking, require_config,
-    set_booking, set_cancel_settlement, set_config,
+    decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement, get_total_escrowed,
+    increase_total_escrowed, next_booking_id, require_booking, require_config, set_booking,
+    set_cancel_settlement, set_config, set_total_escrowed,
 };
 
-use soroban_sdk::{Address, Env, contract, contractimpl, token};
+use soroban_sdk::{Address, Env, contract, contractimpl, panic_with_error, token};
 
 #[contract]
 pub struct StelloBookingContract;
 
 #[contractimpl]
 impl StelloBookingContract {
-    /// Initialize protocol config. Caller must be `config.stello_wallet`. One-time only.
-    pub fn initialize(env: Env, config: Config) -> Result<(), Error> {
-        if get_config(&env).is_some() {
-            return Err(Error::AlreadyInitialized);
+    /// Deploy-time configuration (atomic with contract creation).
+    ///
+    /// Includes `o2o_pool` (required for completion/dispute push splits).
+    /// Invalid config aborts deployment — there is no uninitialized live contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn __constructor(
+        env: Env,
+        stello_wallet: Address,
+        token: Address,
+        ops_pool: Address,
+        review_pool: Address,
+        qa_pool: Address,
+        o2o_pool: Address,
+        host_cancel_fee: i128,
+    ) {
+        let config = Config {
+            stello_wallet,
+            token,
+            ops_pool,
+            review_pool,
+            qa_pool,
+            o2o_pool,
+            host_cancel_fee,
+        };
+        if let Err(err) = validate_config(&env, &config) {
+            panic_with_error!(&env, err);
         }
-        validate_config(&config)?;
-        config.stello_wallet.require_auth();
         set_config(&env, &config);
-        Ok(())
+        set_total_escrowed(&env, 0);
+        // NextBookingId starts at 1 on first `next_booking_id` read; instance TTL
+        // already bumped by `set_config` / `set_total_escrowed`.
     }
 
     pub fn get_config(env: Env) -> Result<Config, Error> {
@@ -72,6 +106,8 @@ impl StelloBookingContract {
 
     /// Global accounted escrow (excludes unsolicited token transfers).
     pub fn get_total_escrowed(env: Env) -> i128 {
+        // Active accounting read — keep shared instance TTL warm.
+        let _ = require_config(&env);
         get_total_escrowed(&env)
     }
 
@@ -89,7 +125,7 @@ impl StelloBookingContract {
     ) -> Result<u64, Error> {
         let config = require_config(&env)?;
         require_stello(&config);
-        validate_parties(&traveller, &host)?;
+        validate_parties(&env, &traveller, &host, &config)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -143,7 +179,7 @@ impl StelloBookingContract {
         if booking.state != BookingState::Created || booking.escrow_locked {
             return Err(Error::InvalidUpdate);
         }
-        validate_parties(&booking.traveller, &host)?;
+        validate_parties(&env, &booking.traveller, &host, &config)?;
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -262,6 +298,11 @@ impl StelloBookingContract {
     }
 
     /// Settle a `Completed` booking: 80/10/5/3/2 push split of escrow.
+    ///
+    /// All state updates and transfers are atomic: if any push fails, the
+    /// transaction reverts — `settled` stays false, `escrow_amount` and
+    /// `total_escrowed` unchanged. Recovery: [`Self::open_dispute`] then
+    /// [`Self::resolve_dispute`].
     ///
     /// **Auth:** Stello wallet. Prevents double settlement.
     pub fn execute_split(env: Env, booking_id: u64) -> Result<SplitAmounts, Error> {
@@ -503,6 +544,8 @@ impl StelloBookingContract {
         }
         .publish(&env);
 
+        // Escrow settlement event only — Host→Ops fee is NOT included in ops_amount.
+        // Indexers must use HostCancellationFeePaid for the external $5 fee.
         SettlementExecuted {
             booking_id,
             settlement_type: SettlementType::HostCancel,
@@ -519,7 +562,12 @@ impl StelloBookingContract {
         Ok(settlement)
     }
 
-    /// Open a dispute while `Escrowed`. Freezes escrow (no fund release). **Auth:** Stello.
+    /// Open a dispute while `Escrowed`, or while `Completed` but still unsettled.
+    ///
+    /// The Completed→Disputed path is recovery when `execute_split` cannot push
+    /// (e.g. a recipient cannot receive the token). Does not change recipient
+    /// addresses on the booking — `resolve_dispute` reallocates via custom BPS.
+    /// **Auth:** Stello.
     pub fn open_dispute(env: Env, booking_id: u64) -> Result<(), Error> {
         let config = require_config(&env)?;
         require_stello(&config);
@@ -528,8 +576,9 @@ impl StelloBookingContract {
         if booking.settled {
             return Err(Error::AlreadySettled);
         }
-        if booking.state != BookingState::Escrowed {
-            return Err(Error::InvalidStateTransition);
+        match booking.state {
+            BookingState::Escrowed | BookingState::Completed => {}
+            _ => return Err(Error::InvalidStateTransition),
         }
         validate_transition(booking.state, BookingState::Disputed)?;
         if booking.escrow_amount <= 0 {
@@ -545,6 +594,7 @@ impl StelloBookingContract {
 
     /// Resolve a dispute with custom BPS allocation (must sum to 10_000).
     /// Pushes escrow atomically to traveller/host/ops/review/qa/o2o. **Auth:** Stello.
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_dispute(
         env: Env,
         booking_id: u64,
@@ -681,35 +731,42 @@ fn require_stello(config: &Config) {
     config.stello_wallet.require_auth();
 }
 
-fn validate_config(config: &Config) -> Result<(), Error> {
+/// Distinct-address policy (MVP):
+///
+/// **Config (constructor):** `stello_wallet`, `token`, `ops_pool`, `review_pool`,
+/// `qa_pool`, and `o2o_pool` are pairwise distinct. None may equal the contract's
+/// own address (would turn push payouts into self-escrow loops).
+///
+/// **Booking parties:** `traveller != host`; neither may equal the contract or
+/// `config.token` (token SAC must never be a booking party). Host and traveller
+/// must also be distinct from all configured financial sinks (`ops` / `review` /
+/// `qa` / `o2o`) and from `stello_wallet`. In particular `host != ops_pool` so
+/// the host-cancel `$5` fee is never a no-op.
+fn validate_config(env: &Env, config: &Config) -> Result<(), Error> {
     if config.host_cancel_fee <= 0 {
         return Err(Error::InvalidAmount);
     }
-    // Addresses are always "present" in Soroban; require pairwise distinctness so
-    // pools / wallets / token cannot silently collapse into one destination.
-    if config.stello_wallet == config.token
-        || config.ops_pool == config.token
-        || config.review_pool == config.token
-        || config.qa_pool == config.token
-        || config.o2o_pool == config.token
-    {
-        return Err(Error::InvalidAddress);
+
+    let contract = env.current_contract_address();
+    let addrs = [
+        &config.stello_wallet,
+        &config.token,
+        &config.ops_pool,
+        &config.review_pool,
+        &config.qa_pool,
+        &config.o2o_pool,
+    ];
+    for a in addrs {
+        if *a == contract {
+            return Err(Error::InvalidAddress);
+        }
     }
-    if config.stello_wallet == config.ops_pool
-        || config.stello_wallet == config.review_pool
-        || config.stello_wallet == config.qa_pool
-        || config.stello_wallet == config.o2o_pool
-    {
-        return Err(Error::InvalidAddress);
-    }
-    if config.ops_pool == config.review_pool
-        || config.ops_pool == config.qa_pool
-        || config.ops_pool == config.o2o_pool
-        || config.review_pool == config.qa_pool
-        || config.review_pool == config.o2o_pool
-        || config.qa_pool == config.o2o_pool
-    {
-        return Err(Error::InvalidAddress);
+    for i in 0..addrs.len() {
+        for j in (i + 1)..addrs.len() {
+            if addrs[i] == addrs[j] {
+                return Err(Error::InvalidAddress);
+            }
+        }
     }
     Ok(())
 }
@@ -721,9 +778,35 @@ fn validate_start_time(env: &Env, start_time: u64) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_parties(traveller: &Address, host: &Address) -> Result<(), Error> {
+fn validate_parties(
+    env: &Env,
+    traveller: &Address,
+    host: &Address,
+    config: &Config,
+) -> Result<(), Error> {
+    let contract = env.current_contract_address();
     if traveller == host {
         return Err(Error::InvalidAddress);
+    }
+    if *traveller == contract || *host == contract {
+        return Err(Error::InvalidAddress);
+    }
+    // Token SAC address must never be accepted as a booking party.
+    if *traveller == config.token || *host == config.token {
+        return Err(Error::InvalidAddress);
+    }
+
+    let sinks = [
+        &config.stello_wallet,
+        &config.ops_pool,
+        &config.review_pool,
+        &config.qa_pool,
+        &config.o2o_pool,
+    ];
+    for sink in sinks {
+        if traveller == sink || host == sink {
+            return Err(Error::InvalidAddress);
+        }
     }
     Ok(())
 }

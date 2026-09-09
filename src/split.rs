@@ -1,17 +1,41 @@
-//! Completion revenue split (basis points, integer math).
+//! Completion / dispute revenue split (basis points, integer math).
 //!
-//! Remainder after flooring each share is assigned to the host so that
-//! `host + ops + review + qa + o2o == amount` exactly.
+//! # Rounding policy (MVP)
+//! - **Completion (`compute_completion_split`):** each share is
+//!   `floor(amount * bps / 10_000)`; any remainder after flooring is assigned
+//!   to the **Host** so the five shares sum exactly to `amount`.
+//! - **Dispute / custom BPS (`compute_bps_amounts`):** same floor-per-share
+//!   rule; remainder is assigned to **`out[0]`** (Traveller in
+//!   `resolve_dispute`). Keep this for MVP unless a stronger invariant requires
+//!   a different remainder recipient.
+//!
+//! # Overflow-safe floor
+//! `bps_floor` uses quotient/remainder decomposition so `amount * bps` is never
+//! formed directly, supporting the full non-negative `i128` range while preserving
+//! exact `floor(amount * bps / 10_000)` semantics.
 use crate::errors::Error;
 use crate::types::{BPS_DENOM, HOST_BPS, O2O_BPS, OPS_BPS, QA_BPS, REVIEW_BPS, SplitAmounts};
 
+/// `floor(amount * bps / BPS_DENOM)` without multiplying `amount * bps` directly.
+///
+/// Decompose `amount = q * DENOM + r`, then:
+/// `floor(amount * bps / DENOM) = q * bps + floor(r * bps / DENOM)`.
 pub(crate) fn bps_floor(amount: i128, bps: u32) -> Result<i128, Error> {
+    if amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
     let bps_i = i128::from(bps);
     let denom = i128::from(BPS_DENOM);
-    amount
+    let q = amount / denom;
+    let r = amount % denom;
+    let high = q.checked_mul(bps_i).ok_or(Error::MathError)?;
+    // r < DENOM and bps <= DENOM in our call sites → r * bps fits comfortably.
+    let low = r
         .checked_mul(bps_i)
-        .and_then(|v| v.checked_div(denom))
-        .ok_or(Error::MathError)
+        .ok_or(Error::MathError)?
+        .checked_div(denom)
+        .ok_or(Error::MathError)?;
+    high.checked_add(low).ok_or(Error::MathError)
 }
 
 /// Split `amount` into completion shares.
@@ -166,5 +190,35 @@ mod tests {
             compute_bps_amounts(100, &[5000, 4000], &mut out),
             Err(Error::InvalidBpsAllocation)
         );
+    }
+
+    #[test]
+    fn extreme_i128_amounts_sum_exactly() {
+        // Near i128::MAX — old amount*bps multiply would overflow.
+        let amounts = [
+            i128::MAX,
+            i128::MAX - 1,
+            i128::MAX / 2,
+            10_000_000_000_000_000_000i128, // 1e19
+            9_007_199_254_740_991i128,      // 2^53-1
+        ];
+        for amount in amounts {
+            assert_sums_to(amount);
+            let s = compute_completion_split(amount).unwrap();
+            assert!(s.host_amount >= 0);
+            assert!(s.ops_amount >= 0);
+
+            let mut out = [0i128; 6];
+            compute_bps_amounts(amount, &[4000, 3000, 1000, 1000, 500, 500], &mut out).unwrap();
+            assert_eq!(out.iter().sum::<i128>(), amount);
+        }
+    }
+
+    #[test]
+    fn bps_floor_matches_naive_for_safe_range() {
+        // Where amount * 8000 fits in i128, compare to naive.
+        let amount = 1_000_000_000_000i128;
+        let naive = amount * 8000 / 10_000;
+        assert_eq!(bps_floor(amount, 8000).unwrap(), naive);
     }
 }
