@@ -28,6 +28,7 @@ Public `get_*` methods are designed for **RPC simulation** (frontend/backend rea
 | `get_booking_id_by_ref` / `get_booking_by_ref` | Lookup via Stello `booking_ref` |
 | `get_total_escrowed` | Accounted escrow total |
 | `get_cancel_settlement` | Cancel settlement breakdown |
+| `contract_version` | Compile-time package version string |
 
 These queries:
 
@@ -44,9 +45,38 @@ Note: an RPC provider may still charge for simulation calls; that is separate fr
 
 | Actor | Actions |
 |-------|---------|
-| Stello wallet | `book`, `update_booking`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute` |
+| Stello wallet | `book`, `update_booking`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`, `upgrade` |
 | Traveller | `lock_escrow` only (`booking.traveller.require_auth()`; USDC transfer from Traveller into escrow) |
 | Host wallet | `cancel_by_host` only (`booking.host.require_auth()`; `$5` fee from host wallet, not escrow) |
+
+## Contract Upgradeability
+
+Stello Wallet is the **sole** upgrade authority (`config.stello_wallet.require_auth()`).
+
+Upgrade keeps the same **Contract ID** and existing storage (bookings, config, escrow accounting). It only replaces the WASM executable.
+
+**Contract upgrade ≠ automatic storage migration.** Every future WASM release must stay storage/ABI-compatible with on-ledger data, or ship an explicit migration strategy.
+
+Typical CLI flow (identities/network are examples — do not hardcode Contract IDs in source):
+
+```bash
+# 1) Upload the new optimized WASM (returns Wasm hash)
+stellar contract upload \
+  --wasm target/wasm32v1-none/release/stello_booking_contract.wasm \
+  --source-account stello-wallet \
+  --network testnet
+
+# 2) Switch the live contract executable to that hash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source-account stello-wallet \
+  --network testnet \
+  -- \
+  upgrade \
+  --new_wasm_hash <HASH>
+```
+
+Gate upgrades with CI (fmt/test/clippy), exact-artifact hash checks, Testnet validation, and build provenance/attestation — same discipline as a fresh deploy.
 
 ## Settlement
 

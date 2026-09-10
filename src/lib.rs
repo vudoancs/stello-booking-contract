@@ -14,11 +14,17 @@
 //!
 //! ## Roles
 //! - **Stello wallet:** `book`, `update_booking`, `check_in`, `complete`,
-//!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`.
+//!   `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`,
+//!   and `upgrade` (sole WASM upgrade authority).
 //! - **Traveller:** `lock_escrow` only (`booking.traveller.require_auth()`; funds
 //!   their own USDC into escrow).
 //! - **Host wallet:** `cancel_by_host` only (`booking.host.require_auth()`).
 //! - Stello Wallet is the sole dispute-resolution authority (MVP; no DAO/multisig).
+//!
+//! ## Upgradeability
+//! `upgrade(new_wasm_hash)` replaces this contract's executable while keeping the
+//! same Contract ID and storage. It does **not** migrate schema; future WASMs must
+//! remain storage-compatible or ship an explicit migration.
 
 mod errors;
 mod events;
@@ -55,7 +61,7 @@ use storage::{
     set_booking_ref_index, set_cancel_settlement, set_config, set_total_escrowed,
 };
 
-use soroban_sdk::{Address, BytesN, Env, contract, contractimpl, panic_with_error, token};
+use soroban_sdk::{Address, BytesN, Env, String, contract, contractimpl, panic_with_error, token};
 
 #[contract]
 pub struct StelloBookingContract;
@@ -767,6 +773,26 @@ impl StelloBookingContract {
             qa_amount,
             o2o_amount,
         })
+    }
+
+    /// Replace this contract's WASM executable. **Auth:** Stello wallet only.
+    ///
+    /// `new_wasm_hash` must already be uploaded on-ledger (`stellar contract upload`).
+    /// Contract ID and storage are preserved; this is **not** an automatic schema
+    /// migration. Soroban emits the system `executable_update` event.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        let config = require_config(&env)?;
+        require_stello(&config);
+        // Active privileged mutation — keep instance/code TTL warm (require_config
+        // already bumped instance TTL).
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Compile-time package version string (e.g. `"0.1.0"`).
+    /// **Read-only** — no auth, no storage, no TTL mutation.
+    pub fn contract_version(env: Env) -> String {
+        String::from_str(&env, env!("CARGO_PKG_VERSION"))
     }
 }
 

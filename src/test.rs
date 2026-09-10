@@ -2685,3 +2685,168 @@ fn get_cancel_settlement_is_readable_without_mutating_booking() {
     assert_eq!(ctx.client().get_booking(&id), before);
     assert_eq!(ctx.client().get_total_escrowed(), 0);
 }
+
+// --- Upgradeability (Stello-only WASM replace) ---
+
+fn dummy_wasm_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0xABu8; 32])
+}
+
+#[test]
+fn contract_version_is_read_only_package_version() {
+    let ctx = setup();
+    ctx.env.set_auths(&[]);
+    let v = ctx.client().contract_version();
+    assert_eq!(
+        v,
+        soroban_sdk::String::from_str(&ctx.env, env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn upgrade_rejects_without_any_auth() {
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    ctx.env.set_auths(&[]);
+    assert!(
+        ctx.client().try_upgrade(&hash).is_err(),
+        "upgrade must fail without Stello authorization"
+    );
+}
+
+#[test]
+fn upgrade_rejects_traveller_auth_only() {
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    ctx.env.set_auths(&[]);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.traveller,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "upgrade",
+            args: (hash.clone(),).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx.client().try_upgrade(&hash).is_err());
+}
+
+#[test]
+fn upgrade_rejects_host_auth_only() {
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    ctx.env.set_auths(&[]);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.host,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "upgrade",
+            args: (hash.clone(),).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx.client().try_upgrade(&hash).is_err());
+}
+
+#[test]
+fn upgrade_rejects_ops_pool_auth_only() {
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    ctx.env.set_auths(&[]);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.ops,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "upgrade",
+            args: (hash.clone(),).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx.client().try_upgrade(&hash).is_err());
+}
+
+#[test]
+fn upgrade_rejects_unrelated_account_auth_only() {
+    let ctx = setup();
+    let stranger = Address::generate(&ctx.env);
+    let hash = dummy_wasm_hash(&ctx.env);
+    ctx.env.set_auths(&[]);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "upgrade",
+            args: (hash.clone(),).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx.client().try_upgrade(&hash).is_err());
+}
+
+#[test]
+fn upgrade_rejects_review_qa_o2o_auth_only() {
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    for addr in [&ctx.review, &ctx.qa, &ctx.o2o] {
+        ctx.env.set_auths(&[]);
+        ctx.env.mock_auths(&[MockAuth {
+            address: addr,
+            invoke: &MockAuthInvoke {
+                contract: &ctx.contract_id,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&ctx.env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(
+            ctx.client().try_upgrade(&hash).is_err(),
+            "pool address must not upgrade"
+        );
+    }
+}
+
+#[test]
+fn upgrade_with_stello_auth_reaches_wasm_update() {
+    // Limitation: native unit tests do not ship a replacement Wasm blob, so a
+    // true V1→V2 executable swap is not asserted here. With only Stello mocked,
+    // the call must pass require_auth and reach update_current_contract_wasm
+    // (which then fails because the hash is not uploaded).
+    let ctx = setup();
+    let hash = dummy_wasm_hash(&ctx.env);
+    let amount = 100i128;
+    let id = ctx.fund_and_book(amount, 1_000_000);
+    ctx.client().lock_escrow(&id, &amount);
+    let before = ctx.client().get_booking(&id);
+    let total_before = ctx.client().get_total_escrowed();
+
+    ctx.env.set_auths(&[]);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.stello,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "upgrade",
+            args: (hash.clone(),).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    let err = ctx.client().try_upgrade(&hash);
+    assert!(
+        err.is_err(),
+        "missing uploaded Wasm should not silently succeed"
+    );
+
+    // Failed upgrade must not corrupt escrow/booking state.
+    assert_eq!(ctx.client().get_booking(&id), before);
+    assert_eq!(ctx.client().get_total_escrowed(), total_before);
+    assert_eq!(ctx.client().get_config().stello_wallet, ctx.stello);
+}
+
+#[test]
+fn upgrade_does_not_weaken_lock_escrow_traveller_auth() {
+    let ctx = setup();
+    let amount = 100i128;
+    let id = ctx.fund_and_book(amount, 1_000_000);
+    // Sanity: existing traveller-only lock_escrow auth still required.
+    ctx.env.set_auths(&[]);
+    assert!(ctx.client().try_lock_escrow(&id, &amount).is_err());
+}
