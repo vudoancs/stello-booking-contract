@@ -50,9 +50,9 @@ use events::{
 };
 use storage::{
     booking_ref_exists, decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement,
-    get_total_escrowed, increase_total_escrowed, next_booking_id, require_booking,
-    require_booking_id_by_ref, require_config, set_booking, set_booking_ref_index,
-    set_cancel_settlement, set_config, set_total_escrowed,
+    get_total_escrowed, increase_total_escrowed, next_booking_id, read_booking,
+    read_booking_id_by_ref, read_config, require_booking, require_config, set_booking,
+    set_booking_ref_index, set_cancel_settlement, set_config, set_total_escrowed,
 };
 
 use soroban_sdk::{Address, BytesN, Env, contract, contractimpl, panic_with_error, token};
@@ -95,25 +95,28 @@ impl StelloBookingContract {
         // already bumped by `set_config` / `set_total_escrowed`.
     }
 
+    /// Read protocol config. **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_config(env: Env) -> Result<Config, Error> {
-        require_config(&env)
+        read_config(&env)
     }
 
+    /// Load a booking by internal id. **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_booking(env: Env, booking_id: u64) -> Result<Booking, Error> {
-        require_booking(&env, booking_id)
+        read_booking(&env, booking_id)
     }
 
+    /// Booking lifecycle state. **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_booking_state(env: Env, booking_id: u64) -> Result<BookingState, Error> {
-        Ok(require_booking(&env, booking_id)?.state)
+        Ok(read_booking(&env, booking_id)?.state)
     }
 
     /// Global accounted escrow (excludes unsolicited token transfers).
+    /// **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_total_escrowed(env: Env) -> i128 {
-        // Active accounting read — keep shared instance TTL warm.
-        let _ = require_config(&env);
         get_total_escrowed(&env)
     }
 
+    /// Traveller/host cancel settlement record. **Read-only** (no auth / TTL bump).
     pub fn get_cancel_settlement(env: Env, booking_id: u64) -> Result<CancelSettlement, Error> {
         load_cancel_settlement(&env, booking_id).ok_or(Error::SettlementNotFound)
     }
@@ -182,15 +185,17 @@ impl StelloBookingContract {
         Ok(booking_id)
     }
 
-    /// Resolve `booking_ref` → internal `booking_id`. **Read-only.**
+    /// Resolve `booking_ref` → internal `booking_id`.
+    /// **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_booking_id_by_ref(env: Env, booking_ref: BytesN<32>) -> Result<u64, Error> {
-        require_booking_id_by_ref(&env, &booking_ref)
+        read_booking_id_by_ref(&env, &booking_ref)
     }
 
-    /// Load the canonical Booking via `booking_ref`. **Read-only.**
+    /// Load the canonical Booking via `booking_ref`.
+    /// **Read-only** (RPC simulation; no auth / TTL bump).
     pub fn get_booking_by_ref(env: Env, booking_ref: BytesN<32>) -> Result<Booking, Error> {
-        let booking_id = require_booking_id_by_ref(&env, &booking_ref)?;
-        require_booking(&env, booking_id)
+        let booking_id = read_booking_id_by_ref(&env, &booking_ref)?;
+        read_booking(&env, booking_id)
     }
 
     /// Update booking fields while still `Created` (before escrow). **Auth:** Stello.

@@ -58,7 +58,7 @@
               "function_name": "book",
               "args": [
                 {
-                  "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                  "bytes": "420000000000000000000000000000000000000000000000000000000000005c"
                 },
                 {
                   "bytes": "5300000000000000000000000000000000000000000000000000000000000001"
@@ -82,39 +82,17 @@
         }
       ]
     ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5",
-              "function_name": "update_booking",
-              "args": [
-                {
-                  "u64": "1"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "i128": "100"
-                },
-                {
-                  "u64": "1500000"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
     []
   ],
   "ledger": {
     "protocol_version": 27,
-    "sequence_number": 490000,
+    "sequence_number": 400001,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -189,26 +167,6 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "4837995959683129791"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6801999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5",
               "key": {
                 "ledger_key_nonce": {
@@ -264,7 +222,7 @@
                       "symbol": "booking_ref"
                     },
                     "val": {
-                      "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                      "bytes": "420000000000000000000000000000000000000000000000000000000000005c"
                     }
                   },
                   {
@@ -336,7 +294,7 @@
                       "symbol": "start_time"
                     },
                     "val": {
-                      "u64": "1500000"
+                      "u64": "1000000"
                     }
                   },
                   {
@@ -377,7 +335,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 990000
+        "live_until": 500000
       },
       {
         "entry": {
@@ -392,7 +350,7 @@
                     "symbol": "BookingRef"
                   },
                   {
-                    "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                    "bytes": "420000000000000000000000000000000000000000000000000000000000005c"
                   }
                 ]
               },
@@ -404,7 +362,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 990000
+        "live_until": 500000
       },
       {
         "entry": {
@@ -521,7 +479,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 990000
+        "live_until": 500000
       },
       {
         "entry": {
@@ -690,7 +648,7 @@
           },
           "ext": "v0"
         },
-        "live_until": 990000
+        "live_until": 500000
       }
     ]
   },
