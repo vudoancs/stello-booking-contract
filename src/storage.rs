@@ -5,24 +5,30 @@
 //! All constants below are **ledgers**. Do not convert them to “days/years” for
 //! protocol decisions: Stellar ledger close time varies by network and era.
 //!
+//! ## Read vs active access
+//! **Public getters** must use pure read helpers (`read_*` / `get_*` without
+//! `extend_ttl`). RPC simulation of those paths does not commit ledger changes
+//! and must not be submitted as fee-paying transactions merely to read data.
+//!
+//! **State-changing** entrypoints use `require_*` / `set_*` helpers that bump
+//! TTL; those extensions persist only when the transaction commits.
+//!
 //! ## Persistent `Booking(id)` and `BookingRef(ref)`
-//! Extended on every write and on successful active reads (`require_booking` /
-//! ref lookups). Both use the same [`PERSISTENT_BOOKING_TTL_*`] policy so the
-//! reverse-lookup index cannot expire significantly earlier than the canonical
-//! booking entry.
+//! Extended on every write and on successful **active** loads (`require_booking`).
+//! Both use the same [`PERSISTENT_BOOKING_TTL_*`] policy so the reverse-lookup
+//! index cannot expire significantly earlier than the canonical booking entry.
 //!
 //! ## Persistent `CancelSettlement(id)`
 //! Written once at traveller/host cancel settlement. Retention is intentionally
 //! **shorter** than active bookings: the record is terminal audit metadata, not
-//! live escrow state. Readers still bump TTL. If archived on-network, Protocol 23+
-//! auto-restore (via simulation restore list) can bring it back on access.
+//! live escrow state. TTL is bumped on write (`set_cancel_settlement`), not on
+//! public getter reads. If archived on-network, Protocol 23+ auto-restore (via
+//! simulation restore list) can bring it back on access.
 //!
 //! ## Instance storage
 //! `Config`, `TotalEscrowed`, and `NextBookingId` share **one** contract-instance
-//! TTL. Call [`bump_instance_ttl`] after instance writes, on active config/
-//! accounting reads, and on meaningful booking activity (persistent writes/reads)
-//! so instance rent stays aligned with active protocol use — never treat those
-//! instance keys as independently expiring.
+//! TTL. Call [`bump_instance_ttl`] after instance writes and on meaningful
+//! state-changing booking activity — never from public getters.
 //!
 //! Per current Stellar docs, `env.storage().instance().extend_ttl(...)` extends
 //! **both** the contract instance entry **and** its contract code (WASM) entry.
@@ -90,12 +96,19 @@ pub fn set_config(env: &Env, config: &Config) {
     bump_instance_ttl(env);
 }
 
+/// Pure instance read — no TTL mutation.
 pub fn get_config(env: &Env) -> Option<Config> {
     env.storage().instance().get(&DataKey::Config)
 }
 
+/// Pure config load for public getters / simulation — no TTL mutation.
+pub fn read_config(env: &Env) -> Result<Config, Error> {
+    get_config(env).ok_or(Error::NotInitialized)
+}
+
+/// Active config access for state-changing entrypoints — bumps instance TTL.
 pub fn require_config(env: &Env) -> Result<Config, Error> {
-    let config = get_config(env).ok_or(Error::NotInitialized)?;
+    let config = read_config(env)?;
     bump_instance_ttl(env);
     Ok(config)
 }
@@ -121,6 +134,7 @@ pub fn peek_next_booking_id(env: &Env) -> u64 {
         .unwrap_or(1)
 }
 
+/// Pure instance read — no TTL mutation.
 pub fn get_total_escrowed(env: &Env) -> i128 {
     env.storage()
         .instance()
@@ -199,14 +213,22 @@ pub fn set_booking(env: &Env, booking: &Booking) {
     bump_instance_ttl(env);
 }
 
+/// Pure persistent read — no TTL mutation.
 pub fn get_booking(env: &Env, booking_id: u64) -> Option<Booking> {
     env.storage()
         .persistent()
         .get(&DataKey::Booking(booking_id))
 }
 
+/// Pure booking load for public getters / simulation — no TTL mutation.
+pub fn read_booking(env: &Env, booking_id: u64) -> Result<Booking, Error> {
+    get_booking(env, booking_id).ok_or(Error::BookingNotFound)
+}
+
+/// Active booking load for state-changing entrypoints — bumps Booking,
+/// BookingRef, and instance TTL.
 pub fn require_booking(env: &Env, booking_id: u64) -> Result<Booking, Error> {
-    let booking = get_booking(env, booking_id).ok_or(Error::BookingNotFound)?;
+    let booking = read_booking(env, booking_id)?;
     bump_booking_and_ref_ttl(env, &booking);
     bump_instance_ttl(env);
     Ok(booking)
@@ -218,10 +240,16 @@ pub fn booking_ref_exists(env: &Env, booking_ref: &BytesN<32>) -> bool {
         .has(&DataKey::BookingRef(booking_ref.clone()))
 }
 
+/// Pure persistent read — no TTL mutation.
 pub fn get_booking_id_by_ref(env: &Env, booking_ref: &BytesN<32>) -> Option<u64> {
     env.storage()
         .persistent()
         .get(&DataKey::BookingRef(booking_ref.clone()))
+}
+
+/// Pure ref → id resolve for public getters / simulation — no TTL mutation.
+pub fn read_booking_id_by_ref(env: &Env, booking_ref: &BytesN<32>) -> Result<u64, Error> {
+    get_booking_id_by_ref(env, booking_ref).ok_or(Error::BookingNotFound)
 }
 
 /// Persist `booking_ref → booking_id` and apply the booking TTL policy.
@@ -232,24 +260,15 @@ pub fn set_booking_ref_index(env: &Env, booking_ref: &BytesN<32>, booking_id: u6
     bump_instance_ttl(env);
 }
 
-pub fn require_booking_id_by_ref(env: &Env, booking_ref: &BytesN<32>) -> Result<u64, Error> {
-    let booking_id = get_booking_id_by_ref(env, booking_ref).ok_or(Error::BookingNotFound)?;
-    // Align TTLs via the canonical booking path.
-    let _ = require_booking(env, booking_id)?;
-    Ok(booking_id)
-}
-
 pub fn set_cancel_settlement(env: &Env, booking_id: u64, settlement: &CancelSettlement) {
     let key = DataKey::CancelSettlement(booking_id);
     env.storage().persistent().set(&key, settlement);
     extend_settlement_ttl(env, booking_id);
 }
 
+/// Pure persistent read — no TTL mutation (public getter path).
 pub fn get_cancel_settlement(env: &Env, booking_id: u64) -> Option<CancelSettlement> {
-    let settlement = env
-        .storage()
+    env.storage()
         .persistent()
-        .get(&DataKey::CancelSettlement(booking_id))?;
-    extend_settlement_ttl(env, booking_id);
-    Some(settlement)
+        .get(&DataKey::CancelSettlement(booking_id))
 }

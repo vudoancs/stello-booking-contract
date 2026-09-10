@@ -12,8 +12,9 @@ use soroban_sdk::{
 
 use crate::{
     BookingState, DEFAULT_HOST_CANCEL_FEE, Error, FOUR_WEEKS, INSTANCE_TTL_EXTEND_TO,
-    PERSISTENT_BOOKING_TTL_EXTEND_TO, PERSISTENT_SETTLEMENT_TTL_EXTEND_TO, StelloBookingContract,
-    StelloBookingContractClient, TWO_WEEKS,
+    PERSISTENT_BOOKING_TTL_EXTEND_TO, PERSISTENT_BOOKING_TTL_THRESHOLD,
+    PERSISTENT_SETTLEMENT_TTL_EXTEND_TO, StelloBookingContract, StelloBookingContractClient,
+    TWO_WEEKS,
     storage::{self, DataKey},
     test_token::{ScriptedToken, ScriptedTokenClient},
 };
@@ -2254,13 +2255,15 @@ fn instance_ttl_bumped_on_booking_activity() {
     let ctx = setup();
     let booking_id = ctx.fund_and_book(100, 1_000_000);
 
-    // Drop remaining TTL below INSTANCE_TTL_THRESHOLD so the next active read extends.
+    // Drop remaining TTL below INSTANCE_TTL_THRESHOLD so the next *mutating*
+    // call extends (public getters must not bump TTL).
     let seq = ctx.env.ledger().sequence();
     ctx.env
         .ledger()
         .set_sequence_number(seq + INSTANCE_TTL_EXTEND_TO - 10_000);
 
-    let _ = ctx.client().get_booking(&booking_id);
+    ctx.client()
+        .update_booking(&booking_id, &ctx.host, &100i128, &1_500_000u64);
     ctx.env.as_contract(&ctx.contract_id, || {
         let instance_ttl = ctx.env.storage().instance().get_ttl();
         assert_eq!(instance_ttl, INSTANCE_TTL_EXTEND_TO);
@@ -2533,7 +2536,9 @@ fn booking_ref_index_ttl_aligned_with_booking() {
         .ledger()
         .set_sequence_number(seq + PERSISTENT_BOOKING_TTL_EXTEND_TO - 10_000);
 
-    let _ = ctx.client().get_booking_by_ref(&bref);
+    // TTL alignment is maintained by state-changing paths, not getters.
+    ctx.client()
+        .update_booking(&id, &ctx.host, &100i128, &1_500_000u64);
     ctx.env.as_contract(&ctx.contract_id, || {
         let booking_ttl = ctx
             .env
@@ -2548,4 +2553,135 @@ fn booking_ref_index_ttl_aligned_with_booking() {
         assert_eq!(booking_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
         assert_eq!(ref_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
     });
+}
+
+// --- Read-only public getters (RPC simulation) ---
+
+#[test]
+fn public_getters_return_expected_values_without_auth() {
+    // setup() uses mock_all_auths for mutating setup only; clear auths before getters.
+    let ctx = setup();
+    let amount = 100i128;
+    let bref = booking_ref(&ctx.env, 90);
+    let sref = service_ref(&ctx.env, 3);
+    let id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    ctx.client().lock_escrow(&id, &amount);
+
+    ctx.env.set_auths(&[]);
+
+    let cfg = ctx.client().get_config();
+    assert_eq!(cfg.stello_wallet, ctx.stello);
+    assert_eq!(cfg.token, ctx.token);
+
+    let b = ctx.client().get_booking(&id);
+    assert_eq!(b.booking_id, id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert_eq!(b.state, BookingState::Escrowed);
+    assert_eq!(ctx.client().get_booking_state(&id), BookingState::Escrowed);
+    assert_eq!(ctx.client().get_booking_id_by_ref(&bref), id);
+    assert_eq!(ctx.client().get_booking_by_ref(&bref), b);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+}
+
+#[test]
+fn public_getters_do_not_mutate_booking_or_accounting() {
+    let ctx = setup();
+    let amount = 250i128;
+    let bref = booking_ref(&ctx.env, 91);
+    let id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), service_ref(&ctx.env, 1));
+    ctx.client().lock_escrow(&id, &amount);
+
+    let before = ctx.client().get_booking(&id);
+    let total_before = ctx.client().get_total_escrowed();
+    let mapped_id = ctx.client().get_booking_id_by_ref(&bref);
+
+    // Repeated getter calls must leave state unchanged.
+    let _ = ctx.client().get_booking(&id);
+    let _ = ctx.client().get_booking_state(&id);
+    let _ = ctx.client().get_booking_by_ref(&bref);
+    let _ = ctx.client().get_booking_id_by_ref(&bref);
+    let _ = ctx.client().get_config();
+    let _ = ctx.client().get_total_escrowed();
+
+    let after = ctx.client().get_booking(&id);
+    assert_eq!(after, before);
+    assert_eq!(after.state, before.state);
+    assert_eq!(after.settled, before.settled);
+    assert_eq!(after.escrow_amount, before.escrow_amount);
+    assert_eq!(after.booking_ref, before.booking_ref);
+    assert_eq!(ctx.client().get_total_escrowed(), total_before);
+    assert_eq!(ctx.client().get_booking_id_by_ref(&bref), mapped_id);
+}
+
+#[test]
+fn public_getters_do_not_extend_ttl() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 92);
+    let id = ctx.fund_and_book_with_refs(100, 1_000_000, bref.clone(), service_ref(&ctx.env, 1));
+
+    let (booking_ttl_before, ref_ttl_before, instance_ttl_before) =
+        ctx.env.as_contract(&ctx.contract_id, || {
+            (
+                ctx.env
+                    .storage()
+                    .persistent()
+                    .get_ttl(&DataKey::Booking(id)),
+                ctx.env
+                    .storage()
+                    .persistent()
+                    .get_ttl(&DataKey::BookingRef(bref.clone())),
+                ctx.env.storage().instance().get_ttl(),
+            )
+        });
+
+    // Advance so remaining TTL falls below extend thresholds; a mutating path
+    // would bump, but getters must not.
+    let seq = ctx.env.ledger().sequence();
+    ctx.env.ledger().set_sequence_number(
+        seq + PERSISTENT_BOOKING_TTL_EXTEND_TO - PERSISTENT_BOOKING_TTL_THRESHOLD + 1,
+    );
+
+    let _ = ctx.client().get_booking(&id);
+    let _ = ctx.client().get_booking_by_ref(&bref);
+    let _ = ctx.client().get_booking_id_by_ref(&bref);
+    let _ = ctx.client().get_config();
+    let _ = ctx.client().get_total_escrowed();
+
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let booking_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Booking(id));
+        let ref_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::BookingRef(bref.clone()));
+        let instance_ttl = ctx.env.storage().instance().get_ttl();
+        // TTL only decreases with ledger progress — not refreshed to EXTEND_TO.
+        assert!(booking_ttl < booking_ttl_before);
+        assert!(ref_ttl < ref_ttl_before);
+        assert!(instance_ttl < instance_ttl_before);
+        assert_ne!(booking_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+        assert_ne!(ref_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+        assert_ne!(instance_ttl, INSTANCE_TTL_EXTEND_TO);
+    });
+}
+
+#[test]
+fn get_cancel_settlement_is_readable_without_mutating_booking() {
+    let ctx = setup();
+    ctx.env.ledger().with_mut(|l| l.timestamp = 0);
+    let amount = 100i128;
+    let id = ctx.reach_escrowed(amount, FOUR_WEEKS);
+    ctx.client().cancel_by_traveller(&id);
+    let before = ctx.client().get_booking(&id);
+
+    ctx.env.set_auths(&[]);
+    let settlement = ctx.client().get_cancel_settlement(&id);
+    assert_eq!(settlement.traveller_amount, 70);
+    assert_eq!(ctx.client().get_booking(&id), before);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
 }

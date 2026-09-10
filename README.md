@@ -17,6 +17,29 @@ True on-chain identity across deployments remains `(contract_id, booking_id)`.
 
 Lookup helpers: `get_booking_id_by_ref`, `get_booking_by_ref`.
 
+## Read-only Contract Queries
+
+Public `get_*` methods are designed for **RPC simulation** (frontend/backend reads):
+
+| Function | Purpose |
+|----------|---------|
+| `get_config` | Protocol config |
+| `get_booking` / `get_booking_state` | Booking by internal id |
+| `get_booking_id_by_ref` / `get_booking_by_ref` | Lookup via Stello `booking_ref` |
+| `get_total_escrowed` | Accounted escrow total |
+| `get_cancel_settlement` | Cancel settlement breakdown |
+
+These queries:
+
+- require **no wallet signature** / `require_auth`
+- do **not** write storage or emit events
+- do **not** extend TTL
+- should **not** be submitted as on-chain transactions merely to read data
+
+TTL for `Booking`, `BookingRef`, instance/`Config`, and cancel-settlement entries is maintained by **state-changing** transactions (`book`, `lock_escrow`, cancels, settlement, etc.).
+
+Note: an RPC provider may still charge for simulation calls; that is separate from Stellar transaction fees. Simulation itself does not commit ledger changes.
+
 ## Roles
 
 | Actor | Actions |
