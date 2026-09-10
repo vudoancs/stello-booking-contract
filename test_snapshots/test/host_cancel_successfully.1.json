@@ -58,6 +58,12 @@
               "function_name": "book",
               "args": [
                 {
+                  "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                },
+                {
+                  "bytes": "5300000000000000000000000000000000000000000000000000000000000001"
+                },
+                {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
@@ -378,6 +384,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "booking_ref"
+                    },
+                    "val": {
+                      "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "cancelled_by"
                     },
                     "val": {
@@ -422,6 +436,14 @@
                     },
                     "val": {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    }
+                  },
+                  {
+                    "key": {
+                      "symbol": "service_ref"
+                    },
+                    "val": {
+                      "bytes": "5300000000000000000000000000000000000000000000000000000000000001"
                     }
                   },
                   {
@@ -473,6 +495,33 @@
                     }
                   }
                 ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 500000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "BookingRef"
+                  },
+                  {
+                    "bytes": "4200000000000000000000000000000000000000000000000000000000000001"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "1"
               }
             }
           },

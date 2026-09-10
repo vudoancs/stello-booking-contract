@@ -1,5 +1,5 @@
 //! Core types for Stello booking / escrow / settlement contract.
-use soroban_sdk::{Address, contracttype};
+use soroban_sdk::{Address, BytesN, contracttype};
 
 /// Booking lifecycle states.
 #[contracttype]
@@ -45,7 +45,12 @@ pub struct Config {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Booking {
+    /// Internal sequential ID for this contract deployment.
     pub booking_id: u64,
+    /// Immutable opaque reference to the Stello backend Booking (globally unique here).
+    pub booking_ref: BytesN<32>,
+    /// Immutable opaque reference to the Stello backend Service (not unique).
+    pub service_ref: BytesN<32>,
     pub traveller: Address,
     pub host: Address,
     pub amount: i128,

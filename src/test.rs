@@ -1,7 +1,8 @@
 #![cfg(test)]
 //! Lifecycle, escrow, settlement, TTL, constructor, auth, and atomicity tests.
+use core::cell::Cell;
 use soroban_sdk::{
-    Address, Env, IntoVal,
+    Address, BytesN, Env, IntoVal,
     testutils::{
         Address as _, Ledger, MockAuth, MockAuthInvoke,
         storage::{Instance as _, Persistent as _},
@@ -13,9 +14,23 @@ use crate::{
     BookingState, DEFAULT_HOST_CANCEL_FEE, Error, FOUR_WEEKS, INSTANCE_TTL_EXTEND_TO,
     PERSISTENT_BOOKING_TTL_EXTEND_TO, PERSISTENT_SETTLEMENT_TTL_EXTEND_TO, StelloBookingContract,
     StelloBookingContractClient, TWO_WEEKS,
-    storage::DataKey,
+    storage::{self, DataKey},
     test_token::{ScriptedToken, ScriptedTokenClient},
 };
+
+fn booking_ref(env: &Env, n: u8) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[0] = b'B';
+    bytes[31] = n;
+    BytesN::from_array(env, &bytes)
+}
+
+fn service_ref(env: &Env, n: u8) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[0] = b'S';
+    bytes[31] = n;
+    BytesN::from_array(env, &bytes)
+}
 
 struct TestCtx {
     env: Env,
@@ -28,6 +43,8 @@ struct TestCtx {
     review: Address,
     qa: Address,
     o2o: Address,
+    /// Allocates unique `booking_ref` values for helper book flows.
+    next_ref: Cell<u8>,
 }
 
 impl TestCtx {
@@ -47,10 +64,37 @@ impl TestCtx {
         self.sac_admin().mint(to, &amount);
     }
 
+    fn alloc_booking_ref(&self) -> BytesN<32> {
+        let n = self.next_ref.get();
+        self.next_ref.set(n.wrapping_add(1));
+        booking_ref(&self.env, n)
+    }
+
     fn fund_and_book(&self, amount: i128, start_time: u64) -> u64 {
+        self.fund_and_book_with_refs(
+            amount,
+            start_time,
+            self.alloc_booking_ref(),
+            service_ref(&self.env, 1),
+        )
+    }
+
+    fn fund_and_book_with_refs(
+        &self,
+        amount: i128,
+        start_time: u64,
+        booking_ref: BytesN<32>,
+        service_ref: BytesN<32>,
+    ) -> u64 {
         self.mint(&self.traveller, amount);
-        self.client()
-            .book(&self.traveller, &self.host, &amount, &start_time)
+        self.client().book(
+            &booking_ref,
+            &service_ref,
+            &self.traveller,
+            &self.host,
+            &amount,
+            &start_time,
+        )
     }
 
     /// book → lock → check_in → complete (not settled).
@@ -132,6 +176,7 @@ fn setup() -> TestCtx {
         review,
         qa,
         o2o,
+        next_ref: Cell::new(1),
     }
 }
 
@@ -289,7 +334,14 @@ fn escrow_rejects_unauthorized_caller() {
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 1),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
 
     // Clear auths: lock_escrow without Traveller authorization must fail.
     env.set_auths(&[]);
@@ -357,7 +409,14 @@ fn lock_escrow_stello_alone_cannot_fund() {
     sac_admin.mint(&traveller, &amount);
     // Also fund Stello so a mistaken Stello→contract transfer could succeed if mis-authorized.
     sac_admin.mint(&stello, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 2),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
 
     env.set_auths(&[]);
     env.mock_auths(&[MockAuth {
@@ -417,7 +476,14 @@ fn lock_escrow_host_cannot_fund() {
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
     sac_admin.mint(&host, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 3),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
 
     env.set_auths(&[]);
     env.mock_auths(&[MockAuth {
@@ -466,7 +532,14 @@ fn lock_escrow_unrelated_account_cannot_fund() {
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
     sac_admin.mint(&stranger, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 4),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
 
     env.set_auths(&[]);
     env.mock_auths(&[MockAuth {
@@ -486,9 +559,14 @@ fn lock_escrow_unrelated_account_cannot_fund() {
 fn lock_escrow_failed_transfer_leaves_created_and_accounting_unchanged() {
     let ctx = setup();
     let amount = 100i128;
-    let booking_id = ctx
-        .client()
-        .book(&ctx.traveller, &ctx.host, &amount, &1_000_000u64);
+    let booking_id = ctx.client().book(
+        &booking_ref(&ctx.env, 5),
+        &service_ref(&ctx.env, 1),
+        &ctx.traveller,
+        &ctx.host,
+        &amount,
+        &1_000_000u64,
+    );
     // Traveller underfunded — transfer must fail and roll back.
     ctx.mint(&ctx.traveller, amount - 1);
     assert_eq!(ctx.client().get_total_escrowed(), 0);
@@ -579,9 +657,14 @@ fn reject_check_in_from_checked_in_and_completed() {
 #[test]
 fn reject_complete_from_created() {
     let ctx = setup();
-    let booking_id = ctx
-        .client()
-        .book(&ctx.traveller, &ctx.host, &100i128, &1_000_000);
+    let booking_id = ctx.client().book(
+        &booking_ref(&ctx.env, 6),
+        &service_ref(&ctx.env, 1),
+        &ctx.traveller,
+        &ctx.host,
+        &100i128,
+        &1_000_000,
+    );
     assert_eq!(
         ctx.client().try_complete(&booking_id),
         Err(Ok(Error::InvalidStateTransition))
@@ -631,8 +714,14 @@ fn reject_update_after_escrow_locked() {
 fn reject_book_identical_traveller_host() {
     let ctx = setup();
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.traveller, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 201),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.traveller,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
 }
@@ -641,8 +730,14 @@ fn reject_book_identical_traveller_host() {
 fn reject_book_non_positive_amount() {
     let ctx = setup();
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.host, &0i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 202),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.host,
+            &0i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAmount))
     );
 }
@@ -929,7 +1024,14 @@ fn traveller_cancel_rejects_unauthorized_caller() {
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &FOUR_WEEKS);
+    let booking_id = client.book(
+        &booking_ref(&env, 7),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &FOUR_WEEKS,
+    );
     client.lock_escrow(&booking_id, &amount);
 
     env.set_auths(&[]);
@@ -1069,7 +1171,14 @@ fn host_cancel_rejects_non_host_without_auth() {
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
     sac_admin.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 8),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
     client.lock_escrow(&booking_id, &amount);
 
     // Clear auths: without host signature, cancel_by_host must fail.
@@ -1303,7 +1412,14 @@ fn open_dispute_rejects_unauthorized() {
 
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 9),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
     client.lock_escrow(&booking_id, &amount);
 
     env.set_auths(&[]);
@@ -1481,13 +1597,25 @@ fn book_rejects_start_time_in_the_past() {
     let ctx = setup();
     ctx.env.ledger().with_mut(|l| l.timestamp = 1_000);
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.host, &100i128, &1_000u64),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 203),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.host,
+            &100i128,
+            &1_000u64
+        ),
         Err(Ok(Error::InvalidStartTime))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.host, &100i128, &999u64),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 204),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.host,
+            &100i128,
+            &999u64
+        ),
         Err(Ok(Error::InvalidStartTime))
     );
 }
@@ -1496,9 +1624,14 @@ fn book_rejects_start_time_in_the_past() {
 fn update_booking_rejects_invalid_start_time() {
     let ctx = setup();
     ctx.env.ledger().with_mut(|l| l.timestamp = 500);
-    let booking_id = ctx
-        .client()
-        .book(&ctx.traveller, &ctx.host, &100i128, &1_000u64);
+    let booking_id = ctx.client().book(
+        &booking_ref(&ctx.env, 10),
+        &service_ref(&ctx.env, 1),
+        &ctx.traveller,
+        &ctx.host,
+        &100i128,
+        &1_000u64,
+    );
 
     assert_eq!(
         ctx.client()
@@ -1720,7 +1853,14 @@ fn failed_execute_split_leaves_completed_unsettled_then_dispute_recovers() {
 
     let amount = 100i128;
     tok.mint(&traveller, &amount);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 11),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
     client.lock_escrow(&booking_id, &amount);
     client.check_in(&booking_id);
     client.complete(&booking_id);
@@ -1844,13 +1984,25 @@ fn constructor_rejects_stello_equals_contract() {
 fn book_rejects_traveller_or_host_equals_contract() {
     let ctx = setup();
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.contract_id, &ctx.host, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 205),
+            &service_ref(&ctx.env, 1),
+            &ctx.contract_id,
+            &ctx.host,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.contract_id, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 206),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.contract_id,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
 }
@@ -1860,8 +2012,14 @@ fn book_rejects_host_equals_ops_pool() {
     let ctx = setup();
     // Host == ops would make host-cancel fee an economic no-op.
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.ops, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 207),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.ops,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
 }
@@ -1870,23 +2028,47 @@ fn book_rejects_host_equals_ops_pool() {
 fn book_rejects_party_equals_payout_sink() {
     let ctx = setup();
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.review, &ctx.host, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 208),
+            &service_ref(&ctx.env, 1),
+            &ctx.review,
+            &ctx.host,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.qa, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 209),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.qa,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.o2o, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 210),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.o2o,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.stello, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 211),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.stello,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
 }
@@ -1895,13 +2077,25 @@ fn book_rejects_party_equals_payout_sink() {
 fn book_rejects_traveller_or_host_equals_token() {
     let ctx = setup();
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.token, &ctx.host, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 212),
+            &service_ref(&ctx.env, 1),
+            &ctx.token,
+            &ctx.host,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
     assert_eq!(
-        ctx.client()
-            .try_book(&ctx.traveller, &ctx.token, &100i128, &1_000_000),
+        ctx.client().try_book(
+            &booking_ref(&ctx.env, 213),
+            &service_ref(&ctx.env, 1),
+            &ctx.traveller,
+            &ctx.token,
+            &100i128,
+            &1_000_000
+        ),
         Err(Ok(Error::InvalidAddress))
     );
 }
@@ -1922,9 +2116,14 @@ fn update_booking_rejects_host_equals_ops() {
 #[test]
 fn stello_auth_required_for_book_recorded() {
     let ctx = setup();
-    let _ = ctx
-        .client()
-        .book(&ctx.traveller, &ctx.host, &100i128, &1_000_000u64);
+    let _ = ctx.client().book(
+        &booking_ref(&ctx.env, 12),
+        &service_ref(&ctx.env, 1),
+        &ctx.traveller,
+        &ctx.host,
+        &100i128,
+        &1_000_000u64,
+    );
     let auths = ctx.env.auths();
     assert!(
         auths.iter().any(|(addr, _)| *addr == ctx.stello),
@@ -1964,7 +2163,14 @@ fn stello_cannot_impersonate_host_for_cancel() {
     let amount = 100i128;
     sac_admin.mint(&traveller, &amount);
     sac_admin.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 13),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
     client.lock_escrow(&booking_id, &amount);
 
     // Only mock Stello for cancel_by_host — host.require_auth must still fail.
@@ -2018,7 +2224,14 @@ fn host_cancel_late_escrow_refund_failure_rolls_back_fee() {
     let amount = 100i128;
     tok.mint(&traveller, &amount);
     tok.mint(&host, &DEFAULT_HOST_CANCEL_FEE);
-    let booking_id = client.book(&traveller, &host, &amount, &1_000_000u64);
+    let booking_id = client.book(
+        &booking_ref(&env, 14),
+        &service_ref(&env, 1),
+        &traveller,
+        &host,
+        &amount,
+        &1_000_000u64,
+    );
     client.lock_escrow(&booking_id, &amount);
 
     tok.arm_fail_to(&traveller);
@@ -2060,4 +2273,279 @@ fn instance_ttl_bumped_on_booking_activity() {
     });
     // Limitation: testutils auto-restore archived entries (Protocol 23+); we assert
     // extend_ttl targets via get_ttl, not irreversible network archival.
+}
+
+// --- booking_ref / service_ref ---
+
+#[test]
+fn book_with_booking_ref_and_service_ref_succeeds() {
+    let ctx = setup();
+    let amount = 100i128;
+    let bref = booking_ref(&ctx.env, 50);
+    let sref = service_ref(&ctx.env, 7);
+    let booking_id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    assert_eq!(booking_id, 1);
+    let b = ctx.client().get_booking(&booking_id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert_eq!(b.booking_id, 1);
+}
+
+#[test]
+fn duplicate_booking_ref_fails() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 51);
+    let sref = service_ref(&ctx.env, 1);
+    let _ = ctx.fund_and_book_with_refs(100, 1_000_000, bref.clone(), sref.clone());
+    assert_eq!(
+        ctx.client().try_book(
+            &bref,
+            &service_ref(&ctx.env, 2),
+            &ctx.traveller,
+            &ctx.host,
+            &200i128,
+            &2_000_000u64
+        ),
+        Err(Ok(Error::DuplicateBookingRef))
+    );
+}
+
+#[test]
+fn duplicate_booking_ref_does_not_mutate_state() {
+    let ctx = setup();
+    let amount = 100i128;
+    let bref = booking_ref(&ctx.env, 52);
+    let sref = service_ref(&ctx.env, 1);
+    let booking_id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    let original = ctx.client().get_booking(&booking_id);
+    let next_before = ctx
+        .env
+        .as_contract(&ctx.contract_id, || storage::peek_next_booking_id(&ctx.env));
+    let total_before = ctx.client().get_total_escrowed();
+
+    assert_eq!(
+        ctx.client().try_book(
+            &bref,
+            &service_ref(&ctx.env, 9),
+            &ctx.traveller,
+            &Address::generate(&ctx.env),
+            &999i128,
+            &9_000_000u64
+        ),
+        Err(Ok(Error::DuplicateBookingRef))
+    );
+
+    let next_after = ctx
+        .env
+        .as_contract(&ctx.contract_id, || storage::peek_next_booking_id(&ctx.env));
+    assert_eq!(next_after, next_before);
+    assert_eq!(ctx.client().get_booking(&booking_id), original);
+    assert_eq!(ctx.client().get_booking_id_by_ref(&bref), booking_id);
+    assert_eq!(
+        ctx.client().try_get_booking(&(booking_id + 1)),
+        Err(Ok(Error::BookingNotFound))
+    );
+    assert_eq!(ctx.client().get_total_escrowed(), total_before);
+}
+
+#[test]
+fn same_service_ref_allows_multiple_bookings() {
+    let ctx = setup();
+    let sref = service_ref(&ctx.env, 3);
+    let id_a = ctx.fund_and_book_with_refs(100, 1_000_000, booking_ref(&ctx.env, 60), sref.clone());
+    let id_b = ctx.fund_and_book_with_refs(200, 2_000_000, booking_ref(&ctx.env, 61), sref.clone());
+    assert_ne!(id_a, id_b);
+    assert_eq!(ctx.client().get_booking(&id_a).service_ref, sref);
+    assert_eq!(ctx.client().get_booking(&id_b).service_ref, sref);
+}
+
+#[test]
+fn same_host_can_have_bookings_for_different_services() {
+    let ctx = setup();
+    let id_a = ctx.fund_and_book_with_refs(
+        100,
+        1_000_000,
+        booking_ref(&ctx.env, 70),
+        service_ref(&ctx.env, 10),
+    );
+    let id_b = ctx.fund_and_book_with_refs(
+        100,
+        2_000_000,
+        booking_ref(&ctx.env, 71),
+        service_ref(&ctx.env, 11),
+    );
+    let a = ctx.client().get_booking(&id_a);
+    let b = ctx.client().get_booking(&id_b);
+    assert_eq!(a.host, ctx.host);
+    assert_eq!(b.host, ctx.host);
+    assert_ne!(a.service_ref, b.service_ref);
+}
+
+#[test]
+fn get_booking_id_by_ref_returns_correct_id() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 80);
+    let id = ctx.fund_and_book_with_refs(100, 1_000_000, bref.clone(), service_ref(&ctx.env, 1));
+    assert_eq!(ctx.client().get_booking_id_by_ref(&bref), id);
+}
+
+#[test]
+fn get_booking_by_ref_returns_correct_booking() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 81);
+    let sref = service_ref(&ctx.env, 4);
+    let id = ctx.fund_and_book_with_refs(150, 1_000_000, bref.clone(), sref.clone());
+    let by_id = ctx.client().get_booking(&id);
+    let by_ref = ctx.client().get_booking_by_ref(&bref);
+    assert_eq!(by_ref, by_id);
+    assert_eq!(by_ref.booking_ref, bref);
+    assert_eq!(by_ref.service_ref, sref);
+}
+
+#[test]
+fn get_booking_by_ref_unknown_ref_fails_cleanly() {
+    let ctx = setup();
+    assert_eq!(
+        ctx.client()
+            .try_get_booking_by_ref(&booking_ref(&ctx.env, 99)),
+        Err(Ok(Error::BookingNotFound))
+    );
+    assert_eq!(
+        ctx.client()
+            .try_get_booking_id_by_ref(&booking_ref(&ctx.env, 99)),
+        Err(Ok(Error::BookingNotFound))
+    );
+}
+
+#[test]
+fn booking_ref_and_service_ref_immutable_via_update_booking() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 82);
+    let sref = service_ref(&ctx.env, 5);
+    let id = ctx.fund_and_book_with_refs(100, 1_000_000, bref.clone(), sref.clone());
+    let new_host = Address::generate(&ctx.env);
+    ctx.client()
+        .update_booking(&id, &new_host, &200i128, &3_000_000u64);
+    let b = ctx.client().get_booking(&id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert_eq!(b.host, new_host);
+    assert_eq!(b.amount, 200);
+}
+
+#[test]
+fn booking_refs_survive_escrow_lock() {
+    let ctx = setup();
+    let amount = 100i128;
+    let bref = booking_ref(&ctx.env, 83);
+    let sref = service_ref(&ctx.env, 6);
+    let id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    ctx.client().lock_escrow(&id, &amount);
+    let b = ctx.client().get_booking(&id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert_eq!(b.escrow_amount, amount);
+    assert_eq!(ctx.client().get_total_escrowed(), amount);
+}
+
+#[test]
+fn booking_refs_survive_happy_path_settlement() {
+    let ctx = setup();
+    let amount = 100_000_000i128;
+    let bref = booking_ref(&ctx.env, 84);
+    let sref = service_ref(&ctx.env, 6);
+    let id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    ctx.client().lock_escrow(&id, &amount);
+    ctx.client().check_in(&id);
+    ctx.client().complete(&id);
+    ctx.client().execute_split(&id);
+    let b = ctx.client().get_booking(&id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert!(b.settled);
+    assert_eq!(b.escrow_amount, 0);
+    assert_eq!(ctx.client().get_total_escrowed(), 0);
+}
+
+#[test]
+fn booking_refs_survive_traveller_and_host_cancel() {
+    let ctx = setup();
+    let amount = 100i128;
+    // Traveller cancel
+    let id_t = ctx.fund_and_book_with_refs(
+        amount,
+        FOUR_WEEKS,
+        booking_ref(&ctx.env, 85),
+        service_ref(&ctx.env, 1),
+    );
+    ctx.client().lock_escrow(&id_t, &amount);
+    let bref_t = ctx.client().get_booking(&id_t).booking_ref;
+    let sref_t = ctx.client().get_booking(&id_t).service_ref;
+    ctx.client().cancel_by_traveller(&id_t);
+    let after_t = ctx.client().get_booking(&id_t);
+    assert_eq!(after_t.booking_ref, bref_t);
+    assert_eq!(after_t.service_ref, sref_t);
+    assert_eq!(after_t.state, BookingState::Cancelled);
+
+    // Host cancel
+    let id_h = ctx.fund_and_book_with_refs(
+        amount,
+        1_000_000,
+        booking_ref(&ctx.env, 86),
+        service_ref(&ctx.env, 2),
+    );
+    ctx.client().lock_escrow(&id_h, &amount);
+    ctx.mint(&ctx.host, DEFAULT_HOST_CANCEL_FEE);
+    let bref_h = ctx.client().get_booking(&id_h).booking_ref;
+    let sref_h = ctx.client().get_booking(&id_h).service_ref;
+    ctx.client().cancel_by_host(&id_h);
+    let after_h = ctx.client().get_booking(&id_h);
+    assert_eq!(after_h.booking_ref, bref_h);
+    assert_eq!(after_h.service_ref, sref_h);
+    assert_eq!(after_h.state, BookingState::Cancelled);
+}
+
+#[test]
+fn booking_refs_survive_dispute_flow() {
+    let ctx = setup();
+    let amount = 100i128;
+    let bref = booking_ref(&ctx.env, 87);
+    let sref = service_ref(&ctx.env, 8);
+    let id = ctx.fund_and_book_with_refs(amount, 1_000_000, bref.clone(), sref.clone());
+    ctx.client().lock_escrow(&id, &amount);
+    ctx.client().open_dispute(&id);
+    ctx.client()
+        .resolve_dispute(&id, &5_000u32, &5_000u32, &0u32, &0u32, &0u32, &0u32);
+    let b = ctx.client().get_booking(&id);
+    assert_eq!(b.booking_ref, bref);
+    assert_eq!(b.service_ref, sref);
+    assert!(b.settled);
+}
+
+#[test]
+fn booking_ref_index_ttl_aligned_with_booking() {
+    let ctx = setup();
+    let bref = booking_ref(&ctx.env, 88);
+    let id = ctx.fund_and_book_with_refs(100, 1_000_000, bref.clone(), service_ref(&ctx.env, 1));
+
+    let seq = ctx.env.ledger().sequence();
+    ctx.env
+        .ledger()
+        .set_sequence_number(seq + PERSISTENT_BOOKING_TTL_EXTEND_TO - 10_000);
+
+    let _ = ctx.client().get_booking_by_ref(&bref);
+    ctx.env.as_contract(&ctx.contract_id, || {
+        let booking_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::Booking(id));
+        let ref_ttl = ctx
+            .env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::BookingRef(bref.clone()));
+        assert_eq!(booking_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+        assert_eq!(ref_ttl, PERSISTENT_BOOKING_TTL_EXTEND_TO);
+    });
 }
