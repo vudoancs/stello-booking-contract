@@ -9,7 +9,7 @@
 //!   [`SettlementExecuted`]).
 //! - [`HostCancellationFeePaid`] is a separate Host → Operations payment
 //!   **outside** booking escrow and is not escrow settlement.
-use soroban_sdk::{Address, contractevent};
+use soroban_sdk::{Address, BytesN, contractevent};
 
 use crate::types::SettlementType;
 
@@ -18,6 +18,10 @@ use crate::types::SettlementType;
 pub struct BookingCreated {
     #[topic]
     pub booking_id: u64,
+    /// Opaque Stello backend Booking id (data, not topic — size/indexing).
+    pub booking_ref: BytesN<32>,
+    /// Opaque Stello backend Service id (data, not topic).
+    pub service_ref: BytesN<32>,
     pub traveller: Address,
     pub host: Address,
     pub amount: i128,

@@ -28,4 +28,6 @@ pub enum Error {
     InvalidStartTime = 19,
     /// Cancel settlement record missing.
     SettlementNotFound = 20,
+    /// `booking_ref` already maps to an on-chain booking (idempotency / uniqueness).
+    DuplicateBookingRef = 21,
 }

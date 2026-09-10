@@ -49,12 +49,13 @@ use events::{
     DisputeOpened, DisputeResolved, EscrowLocked, HostCancellationFeePaid, SettlementExecuted,
 };
 use storage::{
-    decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement, get_total_escrowed,
-    increase_total_escrowed, next_booking_id, require_booking, require_config, set_booking,
+    booking_ref_exists, decrease_total_escrowed, get_cancel_settlement as load_cancel_settlement,
+    get_total_escrowed, increase_total_escrowed, next_booking_id, require_booking,
+    require_booking_id_by_ref, require_config, set_booking, set_booking_ref_index,
     set_cancel_settlement, set_config, set_total_escrowed,
 };
 
-use soroban_sdk::{Address, Env, contract, contractimpl, panic_with_error, token};
+use soroban_sdk::{Address, BytesN, Env, contract, contractimpl, panic_with_error, token};
 
 #[contract]
 pub struct StelloBookingContract;
@@ -118,8 +119,14 @@ impl StelloBookingContract {
     }
 
     /// Create booking in `Created`. **Auth:** Stello wallet.
+    ///
+    /// `booking_ref` must be unique for this deployment (idempotency).
+    /// `service_ref` is opaque and may be shared across bookings.
+    #[allow(clippy::too_many_arguments)]
     pub fn book(
         env: Env,
+        booking_ref: BytesN<32>,
+        service_ref: BytesN<32>,
         traveller: Address,
         host: Address,
         amount: i128,
@@ -133,9 +140,16 @@ impl StelloBookingContract {
         }
         validate_start_time(&env, start_time)?;
 
+        // Uniqueness / idempotency — before any persistent mutation.
+        if booking_ref_exists(&env, &booking_ref) {
+            return Err(Error::DuplicateBookingRef);
+        }
+
         let booking_id = next_booking_id(&env);
         let booking = Booking {
             booking_id,
+            booking_ref: booking_ref.clone(),
+            service_ref: service_ref.clone(),
             traveller: traveller.clone(),
             host: host.clone(),
             amount,
@@ -151,9 +165,12 @@ impl StelloBookingContract {
             cancelled_by: CancelledBy::None,
         };
         set_booking(&env, &booking);
+        set_booking_ref_index(&env, &booking_ref, booking_id);
 
         BookingCreated {
             booking_id,
+            booking_ref,
+            service_ref,
             traveller,
             host,
             amount,
@@ -165,9 +182,21 @@ impl StelloBookingContract {
         Ok(booking_id)
     }
 
+    /// Resolve `booking_ref` → internal `booking_id`. **Read-only.**
+    pub fn get_booking_id_by_ref(env: Env, booking_ref: BytesN<32>) -> Result<u64, Error> {
+        require_booking_id_by_ref(&env, &booking_ref)
+    }
+
+    /// Load the canonical Booking via `booking_ref`. **Read-only.**
+    pub fn get_booking_by_ref(env: Env, booking_ref: BytesN<32>) -> Result<Booking, Error> {
+        let booking_id = require_booking_id_by_ref(&env, &booking_ref)?;
+        require_booking(&env, booking_id)
+    }
+
     /// Update booking fields while still `Created` (before escrow). **Auth:** Stello.
     ///
     /// `start_time` cannot be changed once the booking is `Escrowed`.
+    /// `booking_ref` and `service_ref` are immutable and are never accepted here.
     pub fn update_booking(
         env: Env,
         booking_id: u64,

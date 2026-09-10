@@ -5,11 +5,11 @@
 //! All constants below are **ledgers**. Do not convert them to “days/years” for
 //! protocol decisions: Stellar ledger close time varies by network and era.
 //!
-//! ## Persistent `Booking(id)`
-//! Extended on every write and on successful active reads (`require_booking`).
-//! `PERSISTENT_BOOKING_TTL_EXTEND_TO` is sized to comfortably exceed Stello’s
-//! maximum expected open booking lifecycle (far-future `start_time`, check-in,
-//! completion/dispute) before the entry risks archival.
+//! ## Persistent `Booking(id)` and `BookingRef(ref)`
+//! Extended on every write and on successful active reads (`require_booking` /
+//! ref lookups). Both use the same [`PERSISTENT_BOOKING_TTL_*`] policy so the
+//! reverse-lookup index cannot expire significantly earlier than the canonical
+//! booking entry.
 //!
 //! ## Persistent `CancelSettlement(id)`
 //! Written once at traveller/host cancel settlement. Retention is intentionally
@@ -30,14 +30,14 @@
 //! instance-bump strategy. Threshold checks for instance vs code are applied
 //! independently by the host, but one `instance().extend_ttl` call covers both.
 //!
-//! Persistent `Booking` / `CancelSettlement` entries still have **independent**
-//! TTLs and must continue to be extended individually (they do not share the
-//! instance/code TTL).
+//! Persistent `Booking` / `BookingRef` / `CancelSettlement` entries still have
+//! **independent** TTLs and must continue to be extended individually (they do
+//! not share the instance/code TTL).
 //!
 //! Note: TTL extensions only persist when performed inside a successful
 //! contract invocation that commits; pure off-chain simulation does not.
 
-use soroban_sdk::{Env, contracttype};
+use soroban_sdk::{BytesN, Env, contracttype};
 
 use crate::errors::Error;
 use crate::types::{Booking, CancelSettlement, Config};
@@ -46,7 +46,8 @@ use crate::types::{Booking, CancelSettlement, Config};
 /// [`PERSISTENT_BOOKING_TTL_EXTEND_TO`].
 pub const PERSISTENT_BOOKING_TTL_THRESHOLD: u32 = 100_000;
 
-/// Target remaining TTL (ledgers) for `Booking(id)` after an extension.
+/// Target remaining TTL (ledgers) for `Booking(id)` / `BookingRef(ref)` after
+/// an extension.
 pub const PERSISTENT_BOOKING_TTL_EXTEND_TO: u32 = 500_000;
 
 /// Threshold for `CancelSettlement(id)` (terminal history; see module docs).
@@ -70,12 +71,14 @@ pub enum DataKey {
     NextBookingId,
     TotalEscrowed,
     Booking(u64),
+    /// `booking_ref` → `booking_id` (canonical Booking remains under `Booking(id)`).
+    BookingRef(BytesN<32>),
     CancelSettlement(u64),
 }
 
 /// Extend the shared instance TTL (and, per Stellar docs, the linked contract
-/// code entry). Does **not** extend persistent `Booking` / `CancelSettlement`
-/// keys — those remain independently TTL-managed.
+/// code entry). Does **not** extend persistent `Booking` / `BookingRef` /
+/// `CancelSettlement` keys — those remain independently TTL-managed.
 pub fn bump_instance_ttl(env: &Env) {
     env.storage()
         .instance()
@@ -107,6 +110,15 @@ pub fn next_booking_id(env: &Env) -> u64 {
     env.storage().instance().set(&DataKey::NextBookingId, &next);
     bump_instance_ttl(env);
     id
+}
+
+/// Read the next booking id that would be allocated **without** mutating state.
+#[cfg(test)]
+pub fn peek_next_booking_id(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::NextBookingId)
+        .unwrap_or(1)
 }
 
 pub fn get_total_escrowed(env: &Env) -> i128 {
@@ -151,6 +163,14 @@ fn extend_booking_ttl(env: &Env, booking_id: u64) {
     );
 }
 
+fn extend_booking_ref_ttl(env: &Env, booking_ref: &BytesN<32>) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::BookingRef(booking_ref.clone()),
+        PERSISTENT_BOOKING_TTL_THRESHOLD,
+        PERSISTENT_BOOKING_TTL_EXTEND_TO,
+    );
+}
+
 fn extend_settlement_ttl(env: &Env, booking_id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::CancelSettlement(booking_id),
@@ -159,10 +179,22 @@ fn extend_settlement_ttl(env: &Env, booking_id: u64) {
     );
 }
 
+/// Keep `Booking(id)` and `BookingRef(ref)` TTLs aligned under the same policy.
+fn bump_booking_and_ref_ttl(env: &Env, booking: &Booking) {
+    extend_booking_ttl(env, booking.booking_id);
+    extend_booking_ref_ttl(env, &booking.booking_ref);
+}
+
 pub fn set_booking(env: &Env, booking: &Booking) {
     let key = DataKey::Booking(booking.booking_id);
     env.storage().persistent().set(&key, booking);
-    extend_booking_ttl(env, booking.booking_id);
+    // BookingRef index is written separately at create; subsequent writes bump
+    // both entries when the index already exists.
+    if booking_ref_exists(env, &booking.booking_ref) {
+        bump_booking_and_ref_ttl(env, booking);
+    } else {
+        extend_booking_ttl(env, booking.booking_id);
+    }
     // Keep shared instance/code TTL warm on booking writes.
     bump_instance_ttl(env);
 }
@@ -175,9 +207,36 @@ pub fn get_booking(env: &Env, booking_id: u64) -> Option<Booking> {
 
 pub fn require_booking(env: &Env, booking_id: u64) -> Result<Booking, Error> {
     let booking = get_booking(env, booking_id).ok_or(Error::BookingNotFound)?;
-    extend_booking_ttl(env, booking_id);
+    bump_booking_and_ref_ttl(env, &booking);
     bump_instance_ttl(env);
     Ok(booking)
+}
+
+pub fn booking_ref_exists(env: &Env, booking_ref: &BytesN<32>) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::BookingRef(booking_ref.clone()))
+}
+
+pub fn get_booking_id_by_ref(env: &Env, booking_ref: &BytesN<32>) -> Option<u64> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BookingRef(booking_ref.clone()))
+}
+
+/// Persist `booking_ref → booking_id` and apply the booking TTL policy.
+pub fn set_booking_ref_index(env: &Env, booking_ref: &BytesN<32>, booking_id: u64) {
+    let key = DataKey::BookingRef(booking_ref.clone());
+    env.storage().persistent().set(&key, &booking_id);
+    extend_booking_ref_ttl(env, booking_ref);
+    bump_instance_ttl(env);
+}
+
+pub fn require_booking_id_by_ref(env: &Env, booking_ref: &BytesN<32>) -> Result<u64, Error> {
+    let booking_id = get_booking_id_by_ref(env, booking_ref).ok_or(Error::BookingNotFound)?;
+    // Align TTLs via the canonical booking path.
+    let _ = require_booking(env, booking_id)?;
+    Ok(booking_id)
 }
 
 pub fn set_cancel_settlement(env: &Env, booking_id: u64, settlement: &CancelSettlement) {
