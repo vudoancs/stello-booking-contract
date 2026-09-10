@@ -28,6 +28,7 @@ Public `get_*` methods are designed for **RPC simulation** (frontend/backend rea
 | `get_booking_id_by_ref` / `get_booking_by_ref` | Lookup via Stello `booking_ref` |
 | `get_total_escrowed` | Accounted escrow total |
 | `get_cancel_settlement` | Cancel settlement breakdown |
+| `contract_version` | Compile-time package version string |
 
 These queries:
 
@@ -44,9 +45,38 @@ Note: an RPC provider may still charge for simulation calls; that is separate fr
 
 | Actor | Actions |
 |-------|---------|
-| Stello wallet | `book`, `update_booking`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute` |
+| Stello wallet | `book`, `update_booking`, `check_in`, `complete`, `execute_split`, `cancel_by_traveller`, `open_dispute`, `resolve_dispute`, `upgrade` |
 | Traveller | `lock_escrow` only (`booking.traveller.require_auth()`; USDC transfer from Traveller into escrow) |
 | Host wallet | `cancel_by_host` only (`booking.host.require_auth()`; `$5` fee from host wallet, not escrow) |
+
+## Contract Upgradeability
+
+Stello Wallet is the **sole** upgrade authority (`config.stello_wallet.require_auth()`).
+
+Upgrade keeps the same **Contract ID** and existing storage (bookings, config, escrow accounting). It only replaces the WASM executable.
+
+**Contract upgrade ≠ automatic storage migration.** Every future WASM release must stay storage/ABI-compatible with on-ledger data, or ship an explicit migration strategy.
+
+Typical CLI flow (identities/network are examples — do not hardcode Contract IDs in source):
+
+```bash
+# 1) Upload the new optimized WASM (returns Wasm hash)
+stellar contract upload \
+  --wasm target/wasm32v1-none/release/stello_booking_contract.wasm \
+  --source-account stello-wallet \
+  --network testnet
+
+# 2) Switch the live contract executable to that hash
+stellar contract invoke \
+  --id <CONTRACT_ID> \
+  --source-account stello-wallet \
+  --network testnet \
+  -- \
+  upgrade \
+  --new_wasm_hash <HASH>
+```
+
+Gate upgrades with CI (fmt/test/clippy), exact-artifact hash checks, Testnet validation, and build provenance/attestation — same discipline as a fresh deploy.
 
 ## Settlement
 
@@ -103,16 +133,39 @@ Tag pattern required: `v*-testnet.*` (example: `v0.1.0-testnet.3`).
 
 ### What the Deploy Testnet workflow does
 
-1. Checks out the **exact tagged commit**
-2. Re-runs CI checks on that commit
-3. Builds optimized WASM with provenance meta (`source_repo=github:<owner>/<repo>`, `commit_sha`) and **fails before deploy** if meta does not match
-4. Records `sha256sum` of that exact file (must equal `stellar contract info hash --wasm`)
-5. Creates a **GitHub build provenance attestation** for that exact WASM, then verifies it with `gh attestation verify`
-6. Deploys **the same file** with `--optimize=false` (no second optimize/rebuild)
-7. Uses GitHub Environment **`dev`** for constructor config vars and the Testnet deployer secret
-8. Verifies deployed interface; `get_config` via structured JSON exact field match; `get_total_escrowed == 0`; three-way Wasm hash
-9. Runs `stellar contract info build` with a short bounded retry (may show **pending** if GitHub indexing lags)
-10. Publishes artifacts + a **prerelease** on GitHub
+On `v*-testnet.*` tags, Environment **`dev`** drives either a **first deploy** or an **in-place upgrade**:
+
+| `STELLO_TESTNET_CONTRACT_ID` | Mode | Behavior |
+|------------------------------|------|----------|
+| unset / empty | `DEPLOY` | Deploy new contract with constructor args; **same Contract ID is NOT reused** |
+| whitespace-only / invalid format | **FAIL** | Refuses to run (never silently redeploys) |
+| set to a live ID | `UPGRADE` | Upload exact WASM → `upgrade(new_wasm_hash)` → **same Contract ID** |
+
+Shared gates (both modes):
+
+1. Exact tagged commit checkout
+2. `fmt` / `test` / `clippy`
+3. One optimized WASM build + provenance meta (`source_repo`, `commit_sha`)
+4. Local interface + meta checks (requires `upgrade` + `contract_version`)
+5. `sha256sum` == `stellar contract info hash --wasm`
+6. GitHub build provenance attestation + `gh attestation verify` (**hard fail**; no alternate path)
+7. On-chain verification (interface, `get_config`, hash three-way, version)
+8. Artifacts + GitHub prerelease + Step Summary
+
+**Deploy mode** additionally requires `get_total_escrowed == 0`.
+
+**Upgrade mode** additionally:
+
+- Fails if the target lacks `upgrade` / `contract_version` (old non-upgradeable deployments) — **never** falls back to deploying a new ID
+- Imports `STELLO_WALLET_SECRET_KEY` as temporary CLI identity `stello-wallet` and **fails** if its address ≠ Environment `STELLO_WALLET`
+- Requires on-chain `stello_wallet` == Environment `STELLO_WALLET` (== derived upgrade signer)
+- Snapshots version / config / `total_escrowed` / wasm hash before upgrade
+- Invokes `upgrade` with `--source-account stello-wallet` (not the deployer secret)
+- Requires `total_escrowed` and `get_config` unchanged after upgrade (`total_escrowed` may be `> 0`)
+
+Concurrency: group `stello-testnet-contract` with `cancel-in-progress: false` so two tags cannot upgrade the same contract at once.
+
+Limitation: the workflow **cannot** automatically write `STELLO_TESTNET_CONTRACT_ID` back into the GitHub Environment after first deploy — set it manually from the run Summary.
 
 ### Build Verified (GitHub Attestation)
 
@@ -132,11 +185,14 @@ Use the next Testnet tag (e.g. `v0.1.0-testnet.5`) for a clean attest→deploy t
 
 ### Notes
 
-- Constructor args come from Environment **variables** (not committed): `STELLO_WALLET`, `USDC_TOKEN`, `OPS_POOL`, `REVIEW_POOL`, `QA_POOL`, `O2O_POOL`, optional `HOST_CANCEL_FEE` (default `50000000`).
-- Deployer credential is Environment/repo **secret** `STELLAR_TESTNET_SECRET_KEY` (never printed or written into manifests). Referenced only in the tag-triggered deploy job.
-- `pull_request` / push to `dev` / `main` never deploy. Only `refs/tags/v*-testnet.*` deploy.
-- Deploy job permissions include `contents: write`, `id-token: write`, and `attestations: write` (attestation + release only; not on PR CI).
-- `deploy_tx_hash` is omitted from the manifest unless/until Stellar CLI exposes it reliably (Contract ID is mandatory).
+- **Variables (Environment `dev`):** `STELLO_WALLET`, `USDC_TOKEN`, `OPS_POOL`, `REVIEW_POOL`, `QA_POOL`, `O2O_POOL`, optional `HOST_CANCEL_FEE` (default `50000000`), optional `STELLO_TESTNET_CONTRACT_ID` (required for upgrade mode).
+- **Secrets (Environment `dev`):**
+  - `STELLAR_TESTNET_SECRET_KEY` — deployer / fee payer for **first deploy** (constructor deploy). May differ from Stello Wallet.
+  - `STELLO_WALLET_SECRET_KEY` — key for address `STELLO_WALLET`; **required to sign `upgrade()`**. Never printed.
+- Deployer identity ≠ upgrade authority unless you intentionally use the same key for both.
+- `pull_request` / push to `dev` / `main` never deploy. Only `refs/tags/v*-testnet.*`.
+- Deploy job permissions: `contents: write`, `id-token: write`, `attestations: write`.
+- Automatic upgrade assumes **storage-compatible** WASM; there is no automatic Booking migration.
 - Testnet releases do **not** deploy Mainnet.
 
 ## Manual Deploy (testnet)

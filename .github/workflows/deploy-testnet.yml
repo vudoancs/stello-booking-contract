@@ -1,6 +1,13 @@
-# Testnet deployment for annotated tags: v*-testnet.*
+# Testnet release for annotated tags: v*-testnet.*
+# Modes:
+#   - DEPLOY  when vars.STELLO_TESTNET_CONTRACT_ID is empty (first upgrade-capable instance)
+#   - UPGRADE when vars.STELLO_TESTNET_CONTRACT_ID is set (same Contract ID; never redeploy)
 # Never deploys from pull_request or ordinary branch pushes.
 # Never uses pull_request_target.
+# Never falls back to a new deploy if upgrade fails.
+#
+# Automatic WASM upgrade assumes the new release is storage-compatible with the
+# currently deployed contract. This workflow does not migrate Booking records.
 name: Deploy Testnet
 
 "on":
@@ -8,8 +15,10 @@ name: Deploy Testnet
     tags:
       - "v*-testnet.*"
 
+# Serialize all Testnet contract mutations (deploy or upgrade). Never cancel an
+# in-flight job that may already be submitting an on-chain transaction.
 concurrency:
-  group: deploy-testnet-${{ github.ref }}
+  group: stello-testnet-contract
   cancel-in-progress: false
 
 permissions:
@@ -22,12 +31,10 @@ env:
 
 jobs:
   deploy:
-    name: Build, deploy, verify (Testnet)
+    name: Build, deploy or upgrade, verify (Testnet)
     runs-on: ubuntu-latest
-    # GitHub Environment gates secrets/vars; only this tag-triggered job uses it.
     environment: dev
     permissions:
-      # Release assets + GitHub artifact attestations (SEP-55 Build Verified).
       contents: write
       id-token: write
       attestations: write
@@ -40,9 +47,12 @@ jobs:
       QA_POOL: ${{ vars.QA_POOL }}
       O2O_POOL: ${{ vars.O2O_POOL }}
       HOST_CANCEL_FEE: ${{ vars.HOST_CANCEL_FEE }}
-      # Secret is referenced only inside this deploy job (never CI / PR jobs).
+      STELLO_TESTNET_CONTRACT_ID: ${{ vars.STELLO_TESTNET_CONTRACT_ID }}
+      # Deployer / fee payer for first deployment (and optional fee payer).
       # Do not echo, set -x, or write into artifacts / release notes / manifests.
       STELLAR_SOURCE: ${{ secrets.STELLAR_TESTNET_SECRET_KEY }}
+      # Stello Wallet secret — required to authorize upgrade() (must match vars.STELLO_WALLET).
+      STELLO_WALLET_SOURCE: ${{ secrets.STELLO_WALLET_SECRET_KEY }}
 
     steps:
       - name: Checkout tagged commit
@@ -51,11 +61,11 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      - name: Guard — tag-only deploy
+      - name: Guard — tag-only release
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "::error::Deploy job must only run for tags"
+            echo "::error::Release job must only run for tags"
             exit 1
           fi
           if [[ ! "${GITHUB_REF_NAME}" =~ ^v.*-testnet\..*$ ]]; then
@@ -63,7 +73,34 @@ jobs:
             exit 1
           fi
 
-      - name: Require environment variables
+      - name: Determine release mode (deploy vs upgrade)
+        id: mode
+        run: |
+          set -euo pipefail
+          if [[ -z "${STELLO_TESTNET_CONTRACT_ID:-}" ]]; then
+            echo "release_mode=deploy" >> "${GITHUB_OUTPUT}"
+            echo "RELEASE_MODE=deploy" >> "${GITHUB_ENV}"
+            echo "Mode: DEPLOY (STELLO_TESTNET_CONTRACT_ID unset)"
+          else
+            # Whitespace-only must FAIL (never silently fall back to deploy).
+            RAW_CID="${STELLO_TESTNET_CONTRACT_ID}"
+            CID="$(printf '%s' "${RAW_CID}" | tr -d '[:space:]')"
+            if [[ -z "${CID}" ]]; then
+              echo "::error::STELLO_TESTNET_CONTRACT_ID is whitespace-only. Unset it for first deploy, or set a valid Contract ID. Refusing silent redeploy."
+              exit 1
+            fi
+            if [[ ! "${CID}" =~ ^C[A-Z0-9]{55}$ ]]; then
+              echo "::error::STELLO_TESTNET_CONTRACT_ID has invalid format (expected C + 55 alphanumerics)"
+              exit 1
+            fi
+            echo "release_mode=upgrade" >> "${GITHUB_OUTPUT}"
+            echo "RELEASE_MODE=upgrade" >> "${GITHUB_ENV}"
+            echo "contract_id=${CID}" >> "${GITHUB_OUTPUT}"
+            echo "CONTRACT_ID=${CID}" >> "${GITHUB_ENV}"
+            echo "Mode: UPGRADE contract_id=${CID}"
+          fi
+
+      - name: Require environment variables and mode secrets
         run: |
           set -euo pipefail
           missing=0
@@ -73,34 +110,42 @@ jobs:
               missing=1
             fi
           done
-          if [[ -z "${STELLAR_SOURCE:-}" ]]; then
-            echo "::error::Missing secret STELLAR_TESTNET_SECRET_KEY"
-            missing=1
-          fi
-          if [[ "${missing}" -ne 0 ]]; then
-            exit 1
-          fi
           if [[ -z "${HOST_CANCEL_FEE:-}" ]]; then
             echo "HOST_CANCEL_FEE unset; defaulting to 50000000"
             echo "HOST_CANCEL_FEE=50000000" >> "${GITHUB_ENV}"
           fi
 
+          if [[ "${RELEASE_MODE}" == "deploy" ]]; then
+            if [[ -z "${STELLAR_SOURCE:-}" ]]; then
+              echo "::error::Missing secret STELLAR_TESTNET_SECRET_KEY (required for first deploy)"
+              missing=1
+            fi
+          else
+            if [[ -z "${STELLO_WALLET_SOURCE:-}" ]]; then
+              echo "::error::Missing secret STELLO_WALLET_SECRET_KEY (required to authorize upgrade)"
+              missing=1
+            fi
+          fi
+
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+
       - name: Setup toolchain
         uses: ./.github/actions/setup-contract-ci
 
-      - name: CI checks (must pass before deploy)
+      - name: CI checks (must pass before release)
         run: |
           set -euo pipefail
           cargo fmt --check
           cargo test
           cargo clippy -- -D warnings
 
-      - name: Build optimized WASM from tagged commit (exact deployable artifact)
+      - name: Build optimized WASM from tagged commit (exact release artifact)
         id: build
         run: |
           set -euo pipefail
           # SEP-55 / stellar contract info build require: source_repo=github:<owner>/<repo>
-          # (https://github.com/... is rejected by CLI 28 — only the github: prefix is supported).
           SOURCE_REPO="github:${{ github.repository }}"
           COMMIT_SHA="${{ github.sha }}"
           stellar contract build \
@@ -110,6 +155,13 @@ jobs:
             --meta "commit_sha=${COMMIT_SHA}"
           test -f "${WASM_PATH}"
           echo "source_repo=${SOURCE_REPO}" >> "${GITHUB_OUTPUT}"
+          EXPECTED_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "${EXPECTED_VERSION}" ]]; then
+            echo "::error::Could not parse package version from Cargo.toml"
+            exit 1
+          fi
+          echo "expected_version=${EXPECTED_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "EXPECTED_VERSION=${EXPECTED_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Validate local WASM interface
         run: |
@@ -124,14 +176,19 @@ jobs:
             fi
           done
 
-          for required in __constructor book lock_escrow execute_split cancel_by_host cancel_by_traveller open_dispute resolve_dispute get_config get_total_escrowed; do
+          for required in \
+            __constructor book update_booking lock_escrow check_in complete execute_split \
+            cancel_by_host cancel_by_traveller open_dispute resolve_dispute \
+            get_config get_booking get_booking_state get_booking_id_by_ref get_booking_by_ref \
+            get_total_escrowed get_cancel_settlement upgrade contract_version
+          do
             if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
               echo "::error::Required entrypoint missing in local WASM: ${required}"
               exit 1
             fi
           done
 
-      - name: Verify WASM provenance metadata before deploy (structured)
+      - name: Verify WASM provenance metadata before release (structured)
         env:
           EXPECTED_REPO: ${{ github.repository }}
           EXPECTED_SHA: ${{ github.sha }}
@@ -145,11 +202,11 @@ jobs:
           COMMIT_SHA="$(printf '%s\n' "${META_JSON}" | jq -r '.[] | .sc_meta_v0 | select(.key == "commit_sha") | .val // empty')"
 
           if [[ -z "${SOURCE_REPO}" ]]; then
-            echo "::error::Missing contract meta key source_repo — refusing deploy"
+            echo "::error::Missing contract meta key source_repo — refusing release"
             exit 1
           fi
           if [[ -z "${COMMIT_SHA}" ]]; then
-            echo "::error::Missing contract meta key commit_sha — refusing deploy"
+            echo "::error::Missing contract meta key commit_sha — refusing release"
             exit 1
           fi
           EXPECTED_SOURCE_REPO="github:${EXPECTED_REPO}"
@@ -162,26 +219,31 @@ jobs:
             exit 1
           fi
 
-      - name: Calculate SHA256 of deployable WASM (pre-deploy; do not rebuild after)
+      - name: Calculate SHA256 of release WASM (do not rebuild after)
         id: sha
         run: |
           set -euo pipefail
-          # Exact optimized file that will be deployed — hash before deploy; never rebuild.
-          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]')"
-          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]')"
+          # Soroban WASM hash == SHA-256 of file bytes (lowercase hex, no 0x).
+          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
           echo "sha256sum=${FILE_SHA256}"
           echo "stellar_info_hash_wasm=${LOCAL_STELLAR_HASH}"
+          if [[ ! "${FILE_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid local sha256sum format"
+            exit 1
+          fi
           if [[ "${FILE_SHA256}" != "${LOCAL_STELLAR_HASH}" ]]; then
             echo "::error::sha256sum (${FILE_SHA256}) != stellar contract info hash --wasm (${LOCAL_STELLAR_HASH})"
             exit 1
           fi
           echo "wasm_sha256=${FILE_SHA256}" >> "${GITHUB_OUTPUT}"
           echo "local_stellar_hash=${LOCAL_STELLAR_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "LOCAL_WASM_SHA256=${FILE_SHA256}" >> "${GITHUB_ENV}"
           mkdir -p deployment artifacts
           cp "${WASM_PATH}" artifacts/stello_booking_contract.wasm
           echo "${FILE_SHA256}  stello_booking_contract.wasm" > artifacts/SHA256SUMS
 
-      - name: Attest exact deployable WASM (GitHub build provenance)
+      - name: Attest exact release WASM (GitHub build provenance)
         id: attest
         uses: actions/attest-build-provenance@v4
         with:
@@ -194,16 +256,16 @@ jobs:
         run: |
           set -euo pipefail
           command -v gh >/dev/null
-          # Fail the job if attestation cannot be verified against this repo.
+          # Required release gate — failure must not skip into an alternate deploy path.
           gh attestation verify "${WASM_PATH}" --repo "${{ github.repository }}"
           echo "github_attestation_verification=pass" >> "${GITHUB_ENV}"
 
+      # -------------------- FIRST DEPLOY --------------------
       - name: Deploy exact WASM to Stellar Testnet (--optimize=false)
         id: deploy
+        if: ${{ steps.mode.outputs.release_mode == 'deploy' }}
         run: |
           set -euo pipefail
-          # Deploy the prebuilt optimized bytes unchanged (no second optimize/build).
-          # Capture stdout+stderr; do not print STELLAR_SOURCE; never enable set -x.
           set +e
           DEPLOY_LOG="$(
             stellar contract deploy \
@@ -224,7 +286,6 @@ jobs:
           DEPLOY_STATUS=$?
           set -e
 
-          # Redact accidental secret-key-shaped strings from persisted logs.
           SAFE_LOG="$(printf '%s\n' "${DEPLOY_LOG}" | sed -E 's/S[A-Z0-9]{55}/[REDACTED_SECRET]/g')"
           printf '%s\n' "${SAFE_LOG}" | tee deploy-output.txt
 
@@ -233,7 +294,6 @@ jobs:
             exit "${DEPLOY_STATUS}"
           fi
 
-          # Contract ID is mandatory. Prefer last C... match from CLI output.
           CONTRACT_ID="$(printf '%s\n' "${SAFE_LOG}" | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)"
           if [[ -z "${CONTRACT_ID}" ]]; then
             echo "::error::Could not parse Contract ID from deploy output"
@@ -241,14 +301,346 @@ jobs:
           fi
           echo "CONTRACT_ID=${CONTRACT_ID}"
           echo "contract_id=${CONTRACT_ID}" >> "${GITHUB_OUTPUT}"
-          # deploy_tx_hash: omitted — Stellar CLI 28 deploy stdout does not expose a
-          # stable/documented tx hash field we can parse without fragile scraping.
-          # Do not fabricate; do not fail solely because tx hash is unavailable.
+          echo "CONTRACT_ID=${CONTRACT_ID}" >> "${GITHUB_ENV}"
+          echo "::notice::First deploy complete. Manually set GitHub Environment variable STELLO_TESTNET_CONTRACT_ID=${CONTRACT_ID} for subsequent upgrades."
 
-      - name: Verify deployed interface
+      # -------------------- UPGRADE PATH --------------------
+      - name: Pre-upgrade — verify target contract exists and is upgrade-capable
+        id: pre_upgrade
+        if: ${{ steps.mode.outputs.release_mode == 'upgrade' }}
         run: |
           set -euo pipefail
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          command -v jq >/dev/null
+          CONTRACT_ID="${CONTRACT_ID}"
+
+          # Import Stello Wallet into a temporary CLI identity named `stello-wallet`.
+          # Upgrade must be signed by this identity — never by the deployer secret.
+          STELLAR_CI_CONFIG="$(mktemp -d)"
+          chmod 700 "${STELLAR_CI_CONFIG}"
+          mkdir -p "${STELLAR_CI_CONFIG}/identity"
+          # Write secret to a 0600 identity file; never echo/print it.
+          umask 077
+          printf 'secret_key = "%s"\n' "${STELLO_WALLET_SOURCE}" > "${STELLAR_CI_CONFIG}/identity/stello-wallet.toml"
+          chmod 600 "${STELLAR_CI_CONFIG}/identity/stello-wallet.toml"
+          DERIVED_ADDR="$(
+            stellar keys public-key stello-wallet --config-dir "${STELLAR_CI_CONFIG}" \
+              | tr -d '[:space:]'
+          )"
+          if [[ -z "${DERIVED_ADDR}" || ! "${DERIVED_ADDR}" =~ ^G[A-Z0-9]{55}$ ]]; then
+            echo "::error::Could not derive address from STELLO_WALLET_SECRET_KEY"
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+          if [[ "${DERIVED_ADDR}" != "${STELLO_WALLET}" ]]; then
+            echo "::error::STELLO_WALLET_SECRET_KEY derives to ${DERIVED_ADDR}, but Environment STELLO_WALLET is ${STELLO_WALLET}. Refusing upgrade."
+            rm -rf "${STELLAR_CI_CONFIG}"
+            exit 1
+          fi
+          echo "STELLAR_CI_CONFIG=${STELLAR_CI_CONFIG}" >> "${GITHUB_ENV}"
+          echo "Verified stello-wallet identity == STELLO_WALLET (${DERIVED_ADDR})"
+
+          # A) Target must exist
+          INTERFACE="$(
+            stellar contract info interface \
+              --contract-id "${CONTRACT_ID}" \
+              --network "${NETWORK}"
+          )"
+          printf '%s\n' "${INTERFACE}"
+
+          # B) Must expose upgrade + contract_version — NEVER fall back to deploy
+          for required in upgrade contract_version; do
+            if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
+              echo "::error::Deployed contract ${CONTRACT_ID} is missing '${required}'. It is not upgrade-capable. Deploy a new upgrade-capable contract first (leave STELLO_TESTNET_CONTRACT_ID unset), then set STELLO_TESTNET_CONTRACT_ID to that new ID. Do NOT fall back to auto-deploy."
+              exit 1
+            fi
+          done
+
+          # Snapshot helpers (simulation; --send=no). Signer pays nothing on-chain.
+          invoke_view() {
+            local fn="$1"
+            stellar -q contract invoke \
+              --id "${CONTRACT_ID}" \
+              --source-account stello-wallet \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --network "${NETWORK}" \
+              --send=no \
+              -- \
+              "${fn}"
+          }
+
+          extract_json_object() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for c in [text, *reversed(text.splitlines())]:
+              c = c.strip()
+              if not c:
+                  continue
+              try:
+                  obj = json.loads(c)
+              except json.JSONDecodeError:
+                  continue
+              if isinstance(obj, dict) and "stello_wallet" in obj and "token" in obj:
+                  print(json.dumps(obj, sort_keys=True))
+                  sys.exit(0)
+          sys.stderr.write("get_config did not return a parseable JSON Config object\n")
+          sys.exit(1)
+          PY
+          }
+
+          normalize_i128() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for candidate in [text, *reversed(text.splitlines())]:
+              c = candidate.strip()
+              if not c:
+                  continue
+              try:
+                  val = json.loads(c)
+              except json.JSONDecodeError:
+                  if c.lstrip("-").isdigit():
+                      print(c)
+                      sys.exit(0)
+                  if len(c) >= 2 and c[0] == '"' and c[-1] == '"':
+                      inner = c[1:-1]
+                      if inner.lstrip("-").isdigit():
+                          print(inner)
+                          sys.exit(0)
+                  continue
+              if isinstance(val, bool):
+                  continue
+              if isinstance(val, (int, float)):
+                  print(str(int(val)))
+                  sys.exit(0)
+              if isinstance(val, str) and val.lstrip("-").isdigit():
+                  print(val)
+                  sys.exit(0)
+          sys.stderr.write("could not parse i128/string value\n")
+          sys.exit(1)
+          PY
+          }
+
+          normalize_string() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for candidate in [text, *reversed(text.splitlines())]:
+              c = candidate.strip()
+              if not c:
+                  continue
+              try:
+                  val = json.loads(c)
+              except json.JSONDecodeError:
+                  print(c.strip('"'))
+                  sys.exit(0)
+              if isinstance(val, str):
+                  print(val)
+                  sys.exit(0)
+          print(text.strip().strip('"'))
+          PY
+          }
+
+          # C) Config.stello_wallet must match Environment STELLO_WALLET
+          CONFIG_RAW="$(invoke_view get_config)"
+          CONFIG_JSON="$(extract_json_object "${CONFIG_RAW}")"
+          # Persist normalized compact JSON for post-upgrade equality.
+          printf '%s\n' "${CONFIG_JSON}" | jq -S -c . | tee pre-upgrade-config.json >/dev/null
+          jq -S . pre-upgrade-config.json
+          ONCHAIN_STELLO="$(jq -r '.stello_wallet' pre-upgrade-config.json)"
+          if [[ "${ONCHAIN_STELLO}" != "${STELLO_WALLET}" ]]; then
+            echo "::error::On-chain stello_wallet (${ONCHAIN_STELLO}) != Environment STELLO_WALLET (${STELLO_WALLET}). Refusing upgrade."
+            exit 1
+          fi
+          if [[ "${ONCHAIN_STELLO}" != "${DERIVED_ADDR}" ]]; then
+            echo "::error::On-chain stello_wallet does not match derived upgrade signer address"
+            exit 1
+          fi
+
+          # D) Pre-upgrade snapshots (escrow may be > 0 — that is allowed)
+          OLD_VERSION_RAW="$(invoke_view contract_version)"
+          OLD_VERSION="$(normalize_string "${OLD_VERSION_RAW}")"
+          OLD_TOTAL_RAW="$(invoke_view get_total_escrowed)"
+          OLD_TOTAL="$(normalize_i128 "${OLD_TOTAL_RAW}")"
+          OLD_WASM_HASH="$(
+            stellar contract info hash \
+              --contract-id "${CONTRACT_ID}" \
+              --network "${NETWORK}" \
+              | tr -d '[:space:]' | tr 'A-F' 'a-f'
+          )"
+
+          echo "OLD_CONTRACT_VERSION=${OLD_VERSION}"
+          echo "OLD_TOTAL_ESCROWED=${OLD_TOTAL}"
+          echo "OLD_CONTRACT_WASM_HASH=${OLD_WASM_HASH}"
+
+          {
+            echo "old_contract_version=${OLD_VERSION}"
+            echo "old_total_escrowed=${OLD_TOTAL}"
+            echo "old_wasm_hash=${OLD_WASM_HASH}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "OLD_CONTRACT_VERSION=${OLD_VERSION}" >> "${GITHUB_ENV}"
+          echo "OLD_TOTAL_ESCROWED=${OLD_TOTAL}" >> "${GITHUB_ENV}"
+          echo "OLD_CONTRACT_WASM_HASH=${OLD_WASM_HASH}" >> "${GITHUB_ENV}"
+
+      - name: Upload exact WASM and invoke upgrade (same Contract ID)
+        id: upgrade
+        if: ${{ steps.mode.outputs.release_mode == 'upgrade' }}
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${CONTRACT_ID}"
+          if [[ -z "${STELLAR_CI_CONFIG:-}" || ! -d "${STELLAR_CI_CONFIG}" ]]; then
+            echo "::error::STELLAR_CI_CONFIG missing — stello-wallet identity was not prepared"
+            exit 1
+          fi
+
+          # Upload exact optimized artifact — do not re-optimize/rebuild.
+          # Signed by stello-wallet (verified == STELLO_WALLET), NOT the deployer.
+          set +e
+          UPLOAD_LOG="$(
+            stellar contract upload \
+              --wasm "${WASM_PATH}" \
+              --optimize=false \
+              --source-account stello-wallet \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --network "${NETWORK}" \
+              2>&1
+          )"
+          UPLOAD_STATUS=$?
+          set -e
+
+          SAFE_UPLOAD="$(printf '%s\n' "${UPLOAD_LOG}" | sed -E 's/S[A-Z0-9]{55}/[REDACTED_SECRET]/g')"
+          printf '%s\n' "${SAFE_UPLOAD}" | tee upload-output.txt
+
+          if [[ "${UPLOAD_STATUS}" -ne 0 ]]; then
+            echo "::error::stellar contract upload failed — refusing to deploy a new contract"
+            exit "${UPLOAD_STATUS}"
+          fi
+
+          LOCAL_HASH="$(printf '%s' "${LOCAL_WASM_SHA256}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          if [[ ! "${LOCAL_HASH}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::LOCAL_WASM_SHA256 is not a valid 64-hex Soroban WASM hash"
+            exit 1
+          fi
+
+          # CLI 28 prints the Wasm SHA-256 as 64 hex chars (often labeled "Wasm hash:").
+          # Transaction hashes are also 64-hex — do NOT blindly take the last match.
+          mapfile -t LABELED < <(
+            printf '%s\n' "${SAFE_UPLOAD}" \
+              | sed -nE 's/.*[Ww]asm[[:space:]]+[Hh]ash:[[:space:]]*([a-fA-F0-9]{64}).*/\1/p' \
+              | tr 'A-F' 'a-f' \
+              | tr -d '[:space:]'
+          )
+          mapfile -t STANDALONE < <(
+            printf '%s\n' "${SAFE_UPLOAD}" \
+              | grep -E '^[a-fA-F0-9]{64}$' \
+              | tr 'A-F' 'a-f' \
+              | tr -d '[:space:]' \
+              || true
+          )
+
+          UPLOADED_WASM_HASH=""
+          if [[ "${#LABELED[@]}" -eq 1 ]]; then
+            UPLOADED_WASM_HASH="${LABELED[0]}"
+          elif [[ "${#LABELED[@]}" -gt 1 ]]; then
+            echo "::error::Ambiguous upload output: multiple 'Wasm hash:' lines"
+            printf '%s\n' "${LABELED[@]}"
+            exit 1
+          elif [[ "${#STANDALONE[@]}" -eq 1 ]]; then
+            UPLOADED_WASM_HASH="${STANDALONE[0]}"
+          elif [[ "${#STANDALONE[@]}" -gt 1 ]]; then
+            echo "::error::Ambiguous upload output: multiple standalone 64-hex lines (refusing to guess tx hash vs wasm hash)"
+            printf '%s\n' "${STANDALONE[@]}"
+            exit 1
+          else
+            # Last resort: unique 64-hex tokens in the log must be exactly {LOCAL_HASH}
+            # or exactly one token that equals LOCAL_HASH among possibly many (tx + wasm).
+            mapfile -t ALL_HEX < <(
+              printf '%s\n' "${SAFE_UPLOAD}" \
+                | grep -Eo '[a-fA-F0-9]{64}' \
+                | tr 'A-F' 'a-f' \
+                || true
+            )
+            mapfile -t UNIQUE_HEX < <(printf '%s\n' "${ALL_HEX[@]:-}" | awk 'NF' | sort -u)
+            LOCAL_HITS=0
+            for h in "${UNIQUE_HEX[@]:-}"; do
+              if [[ "${h}" == "${LOCAL_HASH}" ]]; then
+                LOCAL_HITS=$((LOCAL_HITS + 1))
+              fi
+            done
+            if [[ "${LOCAL_HITS}" -eq 1 && "${#UNIQUE_HEX[@]}" -le 2 ]]; then
+              # Accept when local wasm hash appears once among <=2 unique 64-hex tokens
+              # (typical: transaction hash + wasm hash).
+              UPLOADED_WASM_HASH="${LOCAL_HASH}"
+              echo "::notice::Parsed upload hash by matching local WASM SHA-256 among ${#UNIQUE_HEX[@]} unique 64-hex token(s)"
+            else
+              echo "::error::Could not unambiguously parse uploaded WASM hash from stellar contract upload output"
+              echo "unique 64-hex tokens (${#UNIQUE_HEX[@]}):"
+              printf '%s\n' "${UNIQUE_HEX[@]:-}"
+              exit 1
+            fi
+          fi
+
+          if [[ -z "${UPLOADED_WASM_HASH}" || ! "${UPLOADED_WASM_HASH}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Uploaded WASM hash empty or invalid after parsing"
+            exit 1
+          fi
+          if [[ "${UPLOADED_WASM_HASH}" != "${LOCAL_HASH}" ]]; then
+            echo "::error::Uploaded WASM hash (${UPLOADED_WASM_HASH}) != local sha256sum / Soroban wasm hash (${LOCAL_HASH})"
+            exit 1
+          fi
+
+          echo "UPLOADED_WASM_HASH=${UPLOADED_WASM_HASH}"
+          echo "uploaded_wasm_hash=${UPLOADED_WASM_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "UPLOADED_WASM_HASH=${UPLOADED_WASM_HASH}" >> "${GITHUB_ENV}"
+
+          # Invoke upgrade — signed by stello-wallet (NOT the deployer identity).
+          set +e
+          UPGRADE_LOG="$(
+            stellar contract invoke \
+              --id "${CONTRACT_ID}" \
+              --source-account stello-wallet \
+              --config-dir "${STELLAR_CI_CONFIG}" \
+              --network "${NETWORK}" \
+              -- \
+              upgrade \
+              --new_wasm_hash "${UPLOADED_WASM_HASH}" \
+              2>&1
+          )"
+          UPGRADE_STATUS=$?
+          set -e
+
+          SAFE_UPGRADE="$(printf '%s\n' "${UPGRADE_LOG}" | sed -E 's/S[A-Z0-9]{55}/[REDACTED_SECRET]/g')"
+          printf '%s\n' "${SAFE_UPGRADE}" | tee upgrade-output.txt
+
+          if [[ "${UPGRADE_STATUS}" -ne 0 ]]; then
+            echo "::error::upgrade() failed for ${CONTRACT_ID} — NOT deploying a replacement contract"
+            exit "${UPGRADE_STATUS}"
+          fi
+
+          echo "contract_id=${CONTRACT_ID}" >> "${GITHUB_OUTPUT}"
+
+      # -------------------- SHARED POST VERIFICATION --------------------
+      - name: Resolve Contract ID for verification
+        id: release
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_MODE}" == "deploy" ]]; then
+            CID="${{ steps.deploy.outputs.contract_id }}"
+          else
+            CID="${CONTRACT_ID}"
+          fi
+          if [[ -z "${CID}" ]]; then
+            echo "::error::CONTRACT_ID missing after release"
+            exit 1
+          fi
+          echo "contract_id=${CID}" >> "${GITHUB_OUTPUT}"
+          echo "CONTRACT_ID=${CID}" >> "${GITHUB_ENV}"
+
+      - name: Verify deployed/upgraded interface
+        run: |
+          set -euo pipefail
+          CONTRACT_ID="${{ steps.release.outputs.contract_id }}"
           INTERFACE="$(
             stellar contract info interface \
               --contract-id "${CONTRACT_ID}" \
@@ -258,42 +650,65 @@ jobs:
 
           for forbidden in initialize claim_payout claim_host_payout claim_o2o_payout release_refund; do
             if printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${forbidden}\\b|fn[[:space:]]+${forbidden}\\("; then
-              echo "::error::Forbidden entrypoint on deployed contract: ${forbidden}"
+              echo "::error::Forbidden entrypoint on contract: ${forbidden}"
               exit 1
             fi
           done
 
-          for required in __constructor book lock_escrow execute_split cancel_by_host cancel_by_traveller open_dispute resolve_dispute get_config get_total_escrowed; do
+          for required in \
+            __constructor book update_booking lock_escrow check_in complete execute_split \
+            cancel_by_host cancel_by_traveller open_dispute resolve_dispute \
+            get_config get_booking get_booking_state get_booking_id_by_ref get_booking_by_ref \
+            get_total_escrowed get_cancel_settlement upgrade contract_version
+          do
             if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
-              echo "::error::Required entrypoint missing on deployed contract: ${required}"
+              echo "::error::Required entrypoint missing on contract: ${required}"
               exit 1
             fi
           done
 
-      - name: Verify get_config via structured JSON (exact field equality)
+      - name: Post-release get_config / escrow / version checks
+        id: post
         run: |
           set -euo pipefail
           command -v jq >/dev/null
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          CONTRACT_ID="${{ steps.release.outputs.contract_id }}"
 
-          CONFIG_RAW="$(
-            stellar -q contract invoke \
-              --id "${CONTRACT_ID}" \
-              --source-account "${STELLAR_SOURCE}" \
-              --network "${NETWORK}" \
-              --send=no \
-              -- \
-              get_config
-          )"
-          printf '%s\n' "${CONFIG_RAW}" | tee config-output.txt
+          # Prefer verified stello-wallet identity for upgrade views; deployer secret on first deploy.
+          if [[ "${RELEASE_MODE}" == "upgrade" ]]; then
+            if [[ -z "${STELLAR_CI_CONFIG:-}" || ! -d "${STELLAR_CI_CONFIG}" ]]; then
+              echo "::error::STELLAR_CI_CONFIG missing for upgrade post-checks"
+              exit 1
+            fi
+            invoke_view() {
+              local fn="$1"
+              stellar -q contract invoke \
+                --id "${CONTRACT_ID}" \
+                --source-account stello-wallet \
+                --config-dir "${STELLAR_CI_CONFIG}" \
+                --network "${NETWORK}" \
+                --send=no \
+                -- \
+                "${fn}"
+            }
+          else
+            invoke_view() {
+              local fn="$1"
+              stellar -q contract invoke \
+                --id "${CONTRACT_ID}" \
+                --source-account "${STELLAR_SOURCE}" \
+                --network "${NETWORK}" \
+                --send=no \
+                -- \
+                "${fn}"
+            }
+          fi
 
-          # Extract a JSON object from CLI stdout (ignore any non-JSON noise).
-          CONFIG_JSON="$(
-            CONFIG_RAW="${CONFIG_RAW}" python3 - <<'PY'
+          extract_json_object() {
+            RAW="$1" python3 - <<'PY'
           import json, os, sys
-          text = os.environ["CONFIG_RAW"].strip()
-          candidates = [text, *reversed(text.splitlines())]
-          for c in candidates:
+          text = os.environ["RAW"].strip()
+          for c in [text, *reversed(text.splitlines())]:
               c = c.strip()
               if not c:
                   continue
@@ -302,16 +717,71 @@ jobs:
               except json.JSONDecodeError:
                   continue
               if isinstance(obj, dict) and "stello_wallet" in obj and "token" in obj:
-                  print(json.dumps(obj))
+                  print(json.dumps(obj, sort_keys=True))
                   sys.exit(0)
           sys.stderr.write("get_config did not return a parseable JSON Config object\n")
           sys.exit(1)
           PY
-          )"
+          }
 
-          printf '%s\n' "${CONFIG_JSON}" | jq .
+          normalize_i128() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for candidate in [text, *reversed(text.splitlines())]:
+              c = candidate.strip()
+              if not c:
+                  continue
+              try:
+                  val = json.loads(c)
+              except json.JSONDecodeError:
+                  if c.lstrip("-").isdigit():
+                      print(c)
+                      sys.exit(0)
+                  if len(c) >= 2 and c[0] == '"' and c[-1] == '"':
+                      inner = c[1:-1]
+                      if inner.lstrip("-").isdigit():
+                          print(inner)
+                          sys.exit(0)
+                  continue
+              if isinstance(val, bool):
+                  continue
+              if isinstance(val, (int, float)):
+                  print(str(int(val)))
+                  sys.exit(0)
+              if isinstance(val, str) and val.lstrip("-").isdigit():
+                  print(val)
+                  sys.exit(0)
+          sys.stderr.write("could not parse get_total_escrowed value\n")
+          sys.exit(1)
+          PY
+          }
 
-          # Exact equality for constructor-derived Config fields.
+          normalize_string() {
+            RAW="$1" python3 - <<'PY'
+          import json, os, sys
+          text = os.environ["RAW"].strip()
+          for candidate in [text, *reversed(text.splitlines())]:
+              c = candidate.strip()
+              if not c:
+                  continue
+              try:
+                  val = json.loads(c)
+              except json.JSONDecodeError:
+                  print(c.strip('"'))
+                  sys.exit(0)
+              if isinstance(val, str):
+                  print(val)
+                  sys.exit(0)
+          print(text.strip().strip('"'))
+          PY
+          }
+
+          CONFIG_RAW="$(invoke_view get_config)"
+          CONFIG_JSON="$(extract_json_object "${CONFIG_RAW}")"
+          printf '%s\n' "${CONFIG_JSON}" | jq -S -c . | tee config-output.txt >/dev/null
+          jq -S . config-output.txt
+
           jq -e \
             --arg stello_wallet "${STELLO_WALLET}" \
             --arg token "${USDC_TOKEN}" \
@@ -328,84 +798,80 @@ jobs:
             and (.qa_pool == $qa_pool)
             and (.o2o_pool == $o2o_pool)
             and ((.host_cancel_fee | tostring) == ($host_cancel_fee | tostring))
-            ' <<<"${CONFIG_JSON}" >/dev/null \
+            ' config-output.txt >/dev/null \
             || {
               echo "::error::get_config JSON does not exactly match Environment constructor vars"
               exit 1
             }
 
-          echo "config_validation=pass" >> "${GITHUB_ENV}"
+          if [[ "${RELEASE_MODE}" == "upgrade" ]]; then
+            if [[ ! -f pre-upgrade-config.json ]]; then
+              echo "::error::Missing pre-upgrade-config.json snapshot"
+              exit 1
+            fi
+            PRE_NORM="$(jq -S -c . pre-upgrade-config.json)"
+            POST_NORM="$(jq -S -c . config-output.txt)"
+            if [[ "${PRE_NORM}" != "${POST_NORM}" ]]; then
+              echo "::error::get_config changed across upgrade (storage/config not preserved)"
+              echo "pre=${PRE_NORM}"
+              echo "post=${POST_NORM}"
+              exit 1
+            fi
+          fi
 
-      - name: Verify get_total_escrowed == 0 (JSON-aware)
-        run: |
-          set -euo pipefail
-          command -v jq >/dev/null
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          TOTAL_RAW="$(invoke_view get_total_escrowed)"
+          TOTAL_NORM="$(normalize_i128 "${TOTAL_RAW}")"
+          echo "get_total_escrowed=${TOTAL_NORM}"
 
-          TOTAL_RAW="$(
-            stellar -q contract invoke \
-              --id "${CONTRACT_ID}" \
-              --source-account "${STELLAR_SOURCE}" \
-              --network "${NETWORK}" \
-              --send=no \
-              -- \
-              get_total_escrowed
-          )"
-          printf 'get_total_escrowed raw=%s\n' "${TOTAL_RAW}"
+          if [[ "${RELEASE_MODE}" == "deploy" ]]; then
+            if [[ "${TOTAL_NORM}" != "0" ]]; then
+              echo "::error::Expected get_total_escrowed == 0 for fresh deploy, got: ${TOTAL_NORM}"
+              exit 1
+            fi
+          else
+            if [[ "${TOTAL_NORM}" != "${OLD_TOTAL_ESCROWED}" ]]; then
+              echo "::error::total_escrowed changed across upgrade: before=${OLD_TOTAL_ESCROWED} after=${TOTAL_NORM}"
+              exit 1
+            fi
+          fi
 
-          # i128 may be returned as a bare number, a JSON string, or with whitespace.
-          TOTAL_NORM="$(
-            TOTAL_RAW="${TOTAL_RAW}" python3 - <<'PY'
-          import json, os, sys
-          text = os.environ["TOTAL_RAW"].strip()
-          for candidate in [text, *reversed(text.splitlines())]:
-              c = candidate.strip()
-              if not c:
-                  continue
-              try:
-                  val = json.loads(c)
-              except json.JSONDecodeError:
-                  if c.lstrip("-").isdigit():
-                      print(c)
-                      sys.exit(0)
-                  continue
-              if isinstance(val, bool):
-                  continue
-              if isinstance(val, (int, float)):
-                  print(str(int(val)))
-                  sys.exit(0)
-              if isinstance(val, str) and val.lstrip("-").isdigit():
-                  print(val)
-                  sys.exit(0)
-          sys.stderr.write("could not parse get_total_escrowed value\n")
-          sys.exit(1)
-          PY
-          )"
-
-          echo "get_total_escrowed_normalized=${TOTAL_NORM}"
-          if [[ "${TOTAL_NORM}" != "0" ]]; then
-            echo "::error::Expected get_total_escrowed == 0 for fresh deploy, got: ${TOTAL_NORM}"
+          VERSION_RAW="$(invoke_view contract_version)"
+          NEW_VERSION="$(normalize_string "${VERSION_RAW}")"
+          echo "contract_version=${NEW_VERSION}"
+          if [[ "${NEW_VERSION}" != "${EXPECTED_VERSION}" ]]; then
+            echo "::error::contract_version (${NEW_VERSION}) != Cargo.toml version (${EXPECTED_VERSION})"
             exit 1
           fi
 
+          echo "new_contract_version=${NEW_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "new_total_escrowed=${TOTAL_NORM}" >> "${GITHUB_OUTPUT}"
+          echo "NEW_CONTRACT_VERSION=${NEW_VERSION}" >> "${GITHUB_ENV}"
+          echo "NEW_TOTAL_ESCROWED=${TOTAL_NORM}" >> "${GITHUB_ENV}"
+          echo "config_validation=pass" >> "${GITHUB_ENV}"
+
       - name: Three-way Wasm hash verification (file == --wasm == --contract-id)
+        id: hash_verify
         run: |
           set -euo pipefail
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          CONTRACT_ID="${{ steps.release.outputs.contract_id }}"
 
-          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]')"
-          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]')"
+          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
           DEPLOYED_STELLAR_HASH="$(
             stellar contract info hash \
               --contract-id "${CONTRACT_ID}" \
               --network "${NETWORK}" \
-              | tr -d '[:space:]'
+              | tr -d '[:space:]' | tr 'A-F' 'a-f'
           )"
 
           echo "sha256sum(local file)=${FILE_SHA256}"
           echo "stellar contract info hash --wasm=${LOCAL_STELLAR_HASH}"
           echo "stellar contract info hash --contract-id=${DEPLOYED_STELLAR_HASH}"
 
+          if [[ ! "${FILE_SHA256}" =~ ^[a-f0-9]{64}$ ]]; then
+            echo "::error::Invalid local file hash format"
+            exit 1
+          fi
           if [[ "${FILE_SHA256}" != "${LOCAL_STELLAR_HASH}" ]]; then
             echo "::error::sha256sum != stellar info hash --wasm"
             exit 1
@@ -414,22 +880,35 @@ jobs:
             echo "::error::local stellar --wasm hash != deployed --contract-id hash"
             exit 1
           fi
-          # Cross-check against the pre-deploy recorded hash (exact artifact continuity).
-          PRE_DEPLOY="${{ steps.sha.outputs.wasm_sha256 }}"
-          if [[ "${FILE_SHA256}" != "${PRE_DEPLOY}" ]]; then
+          PRE="$(printf '%s' "${{ steps.sha.outputs.wasm_sha256 }}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+          if [[ "${FILE_SHA256}" != "${PRE}" ]]; then
             echo "::error::WASM changed after SHA256 step (rebuild/transform detected)"
             exit 1
           fi
+          if [[ "${RELEASE_MODE}" == "upgrade" ]]; then
+            UP="$(printf '%s' "${UPLOADED_WASM_HASH}" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+            if [[ "${DEPLOYED_STELLAR_HASH}" != "${UP}" ]]; then
+              echo "::error::deployed hash != uploaded hash"
+              exit 1
+            fi
+            EXPECTED_CID="${{ steps.mode.outputs.contract_id }}"
+            if [[ "${CONTRACT_ID}" != "${EXPECTED_CID}" ]]; then
+              echo "::error::Contract ID changed during upgrade (${CONTRACT_ID} != ${EXPECTED_CID})"
+              exit 1
+            fi
+          fi
+
+          echo "deployed_wasm_hash=${DEPLOYED_STELLAR_HASH}" >> "${GITHUB_OUTPUT}"
+          echo "DEPLOYED_CONTRACT_WASM_HASH=${DEPLOYED_STELLAR_HASH}" >> "${GITHUB_ENV}"
 
       - name: Stellar contract info build (bounded retry; may be eventually consistent)
         id: build_info
         run: |
           set -euo pipefail
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          CONTRACT_ID="${{ steps.release.outputs.contract_id }}"
           BUILD_INFO_STATUS="pending"
           BUILD_INFO_LOG=""
 
-          # Attestation indexing can lag briefly after create; do not fail the deploy.
           for attempt in 1 2 3 4 5 6; do
             echo "stellar contract info build attempt ${attempt}/6"
             set +e
@@ -444,12 +923,10 @@ jobs:
             printf '%s\n' "${BUILD_INFO_LOG}"
 
             if [[ "${STATUS}" -eq 0 ]]; then
-              # Treat clear success markers from CLI as verified; otherwise keep pending.
               if printf '%s\n' "${BUILD_INFO_LOG}" | grep -Eiq 'Attestation found|Build Verified|Workflow Run|github.com/.*/actions/runs'; then
                 BUILD_INFO_STATUS="verified"
                 break
               fi
-              # Successful exit without attestation payload — still pending/unknown.
               BUILD_INFO_STATUS="pending"
             else
               BUILD_INFO_STATUS="pending"
@@ -473,17 +950,25 @@ jobs:
           echo "stellar_build_info=${BUILD_INFO_STATUS}" >> "${GITHUB_OUTPUT}"
           echo "STELLAR_BUILD_INFO_STATUS=${BUILD_INFO_STATUS}" >> "${GITHUB_ENV}"
           if [[ "${BUILD_INFO_STATUS}" != "verified" ]]; then
-            echo "::warning::Stellar Build Info remains pending after retries (deploy still OK if chain checks passed)"
+            echo "::warning::Stellar Build Info remains pending after retries (release still OK if chain checks passed)"
           fi
 
       - name: Write deployment/testnet.json
         env:
-          CONTRACT_ID: ${{ steps.deploy.outputs.contract_id }}
+          CONTRACT_ID: ${{ steps.release.outputs.contract_id }}
           WASM_SHA256: ${{ steps.sha.outputs.wasm_sha256 }}
           GIT_TAG: ${{ github.ref_name }}
           GIT_COMMIT: ${{ github.sha }}
           SOURCE_REPO: github:${{ github.repository }}
           ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          RELEASE_MODE: ${{ steps.mode.outputs.release_mode }}
+          CONTRACT_VERSION: ${{ steps.post.outputs.new_contract_version }}
+          UPLOADED_WASM_HASH: ${{ env.UPLOADED_WASM_HASH }}
+          DEPLOYED_WASM_HASH: ${{ steps.hash_verify.outputs.deployed_wasm_hash }}
+          PREV_VERSION: ${{ steps.pre_upgrade.outputs.old_contract_version }}
+          PREV_WASM: ${{ steps.pre_upgrade.outputs.old_wasm_hash }}
+          ESCROW_BEFORE: ${{ steps.pre_upgrade.outputs.old_total_escrowed }}
+          ESCROW_AFTER: ${{ steps.post.outputs.new_total_escrowed }}
         run: |
           set -euo pipefail
           mkdir -p deployment artifacts
@@ -492,16 +977,32 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
 
+          mode = os.environ["RELEASE_MODE"]
           data = {
               "network": "testnet",
+              "release_mode": mode,
               "contract_id": os.environ["CONTRACT_ID"],
-              "git_commit": os.environ["GIT_COMMIT"],
+              "git_commit_sha": os.environ["GIT_COMMIT"],
               "git_tag": os.environ["GIT_TAG"],
-              "wasm_sha256": os.environ["WASM_SHA256"],
+              "contract_version": os.environ.get("CONTRACT_VERSION", ""),
+              "local_wasm_sha256": os.environ["WASM_SHA256"],
+              "deployed_contract_wasm_hash": os.environ.get("DEPLOYED_WASM_HASH", ""),
               "deployed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "source_repo": os.environ["SOURCE_REPO"],
           }
-          # deploy_tx_hash intentionally omitted (no reliable CLI field).
+          uploaded = os.environ.get("UPLOADED_WASM_HASH", "").strip()
+          if uploaded:
+              data["uploaded_wasm_hash"] = uploaded
+          elif mode == "deploy":
+              # First deploy: uploaded hash == local/deployed hash (no separate upload step).
+              data["uploaded_wasm_hash"] = data["local_wasm_sha256"]
+
+          if mode == "upgrade":
+              data["previous_contract_version"] = os.environ.get("PREV_VERSION", "")
+              data["previous_wasm_hash"] = os.environ.get("PREV_WASM", "")
+              data["total_escrowed_before"] = os.environ.get("ESCROW_BEFORE", "")
+              data["total_escrowed_after"] = os.environ.get("ESCROW_AFTER", "")
+
           att = os.environ.get("ATTESTATION_URL", "").strip()
           if att:
               data["attestation_url"] = att
@@ -512,7 +1013,7 @@ jobs:
           print(path.read_text())
           PY
 
-      - name: Upload deployment artifacts
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: stello_booking_contract-testnet-${{ github.ref_name }}
@@ -529,12 +1030,27 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
-          CONTRACT_ID="${{ steps.deploy.outputs.contract_id }}"
+          CONTRACT_ID="${{ steps.release.outputs.contract_id }}"
           WASM_SHA256="${{ steps.sha.outputs.wasm_sha256 }}"
+          MODE="${{ steps.mode.outputs.release_mode }}"
+          VERSION="${NEW_CONTRACT_VERSION:-}"
           ATTEST_LINE="Build provenance: GitHub Attestation generated"
           if [[ -n "${ATTESTATION_URL:-}" ]]; then
             ATTEST_LINE="${ATTEST_LINE}
           Attestation URL: ${ATTESTATION_URL}"
+          fi
+
+          EXTRA=""
+          if [[ "${MODE}" == "deploy" ]]; then
+            EXTRA="Mode: DEPLOY (new Contract ID)
+          IMPORTANT: Set GitHub Environment variable STELLO_TESTNET_CONTRACT_ID=${CONTRACT_ID} for subsequent auto-upgrades."
+          else
+            EXTRA="Mode: UPGRADE (same Contract ID)
+          Previous version: ${OLD_CONTRACT_VERSION:-}
+          New version: ${VERSION}
+          Previous WASM: ${OLD_CONTRACT_WASM_HASH:-}
+          New WASM: ${DEPLOYED_CONTRACT_WASM_HASH:-}
+          Total escrowed before/after: ${OLD_TOTAL_ESCROWED:-} / ${NEW_TOTAL_ESCROWED:-}"
           fi
 
           NOTES="$(cat <<EOF
@@ -543,8 +1059,10 @@ jobs:
           Git tag: ${TAG}
           Git commit: ${{ github.sha }}
           Contract ID: ${CONTRACT_ID}
+          Contract version: ${VERSION}
           WASM SHA256: ${WASM_SHA256}
           Network: Stellar Testnet
+          ${EXTRA}
           ${ATTEST_LINE}
 
           Artifacts: WASM, SHA256SUMS, deployment/testnet.json
@@ -569,24 +1087,47 @@ jobs:
               --target "${{ github.sha }}"
           fi
 
-      - name: Deployment summary
+      - name: Release summary
+        if: ${{ success() }}
         run: |
+          set -euo pipefail
           BUILD_INFO_STATUS="${STELLAR_BUILD_INFO_STATUS:-pending}"
+          MODE="${{ steps.mode.outputs.release_mode }}"
           {
-            echo "## Stello Booking Contract Testnet Deployment"
+            echo "## Stello Testnet Release"
             echo
             echo "| Field | Value |"
             echo "| --- | --- |"
+            echo "| Mode | \`${MODE}\` |"
             echo "| Tag | \`${{ github.ref_name }}\` |"
             echo "| Commit | \`${{ github.sha }}\` |"
-            echo "| Contract ID | \`${{ steps.deploy.outputs.contract_id }}\` |"
-            echo "| WASM SHA256 | \`${{ steps.sha.outputs.wasm_sha256 }}\` |"
-            echo "| Network | Stellar Testnet |"
-            echo "| Three-way Wasm hash | pass |"
-            echo "| Provenance meta | pass |"
-            echo "| get_config (JSON exact) | pass |"
-            echo "| get_total_escrowed | 0 |"
+            echo "| Contract ID | \`${{ steps.release.outputs.contract_id }}\` |"
+            echo "| Contract version | \`${NEW_CONTRACT_VERSION:-}\` |"
+            echo "| Local WASM SHA256 | \`${{ steps.sha.outputs.wasm_sha256 }}\` |"
+            echo "| Deployed WASM hash | \`${DEPLOYED_CONTRACT_WASM_HASH:-}\` |"
+            if [[ "${MODE}" == "upgrade" ]]; then
+              echo "| Previous version | \`${OLD_CONTRACT_VERSION:-}\` |"
+              echo "| Previous WASM | \`${OLD_CONTRACT_WASM_HASH:-}\` |"
+              echo "| Uploaded WASM hash | \`${UPLOADED_WASM_HASH:-}\` |"
+              echo "| Total escrowed before | \`${OLD_TOTAL_ESCROWED:-}\` |"
+              echo "| Total escrowed after | \`${NEW_TOTAL_ESCROWED:-}\` |"
+              echo "| Config preserved | PASS |"
+            else
+              echo "| get_total_escrowed | 0 |"
+              echo "| Configure next | Set \`STELLO_TESTNET_CONTRACT_ID\` to this Contract ID |"
+            fi
+            echo "| Interface verification | PASS |"
+            echo "| Hash verification | PASS |"
             echo "| Build Attestation | pass |"
             echo "| GitHub Attestation Verification | pass |"
             echo "| Stellar Build Info | ${BUILD_INFO_STATUS} |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Cleanup temporary Stellar CLI identity
+        if: ${{ always() && steps.mode.outputs.release_mode == 'upgrade' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${STELLAR_CI_CONFIG:-}" && -d "${STELLAR_CI_CONFIG}" ]]; then
+            rm -rf "${STELLAR_CI_CONFIG}"
+            echo "Removed temporary STELLAR_CI_CONFIG"
+          fi
