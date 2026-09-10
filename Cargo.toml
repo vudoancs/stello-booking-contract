@@ -1,13 +1,27 @@
 [package]
 name = "stello_booking_contract"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-soroban-sdk = "23.0.3"
+soroban-sdk = "27.0.1"
 
 [dev-dependencies]
-soroban-sdk = { version = "23.0.3", features = ["testutils"] }
+soroban-sdk = { version = "27.0.1", features = ["testutils"] }
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release-with-logs]
+inherits = "release"
+strip = "none"
+debug-assertions = true
+

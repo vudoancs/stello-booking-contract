@@ -1,0 +1,147 @@
+# Continuous integration for stello_booking_contract.
+# Runs checks and builds WASM. Never deploys.
+name: CI
+
+"on":
+  pull_request:
+  push:
+    branches:
+      - dev
+      - main
+    tags:
+      - "v*-testnet.*"
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  WASM_PATH: target/wasm32v1-none/release/stello_booking_contract.wasm
+
+jobs:
+  check:
+    name: fmt / test / clippy / build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup toolchain
+        uses: ./.github/actions/setup-contract-ci
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build optimized WASM (with provenance meta)
+        run: |
+          set -euo pipefail
+          # SEP-55 / stellar contract info build: source_repo=github:<owner>/<repo>
+          stellar contract build \
+            --package stello_booking_contract \
+            --optimize \
+            --meta "source_repo=github:${{ github.repository }}" \
+            --meta "commit_sha=${{ github.sha }}"
+          test -f "${WASM_PATH}"
+
+      - name: Inspect WASM interface
+        id: interface
+        run: |
+          set -euo pipefail
+          INTERFACE="$(stellar contract info interface --wasm "${WASM_PATH}")"
+          printf '%s\n' "${INTERFACE}"
+
+          for forbidden in initialize claim_payout claim_host_payout claim_o2o_payout release_refund; do
+            if printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${forbidden}\\b|fn[[:space:]]+${forbidden}\\("; then
+              echo "::error::Deprecated/forbidden entrypoint present in WASM interface: ${forbidden}"
+              exit 1
+            fi
+          done
+
+          for required in __constructor book lock_escrow execute_split cancel_by_host cancel_by_traveller open_dispute resolve_dispute get_config get_total_escrowed; do
+            if ! printf '%s\n' "${INTERFACE}" | grep -E -q "fn[[:space:]]+${required}\\b|fn[[:space:]]+${required}\\("; then
+              echo "::error::Required entrypoint missing from WASM interface: ${required}"
+              exit 1
+            fi
+          done
+
+          echo "interface_ok=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify WASM provenance metadata (structured)
+        env:
+          EXPECTED_REPO: ${{ github.repository }}
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null
+          META_JSON="$(stellar contract info meta --wasm "${WASM_PATH}" --output json)"
+          printf '%s\n' "${META_JSON}" | jq .
+
+          SOURCE_REPO="$(printf '%s\n' "${META_JSON}" | jq -r '.[] | .sc_meta_v0 | select(.key == "source_repo") | .val // empty')"
+          COMMIT_SHA="$(printf '%s\n' "${META_JSON}" | jq -r '.[] | .sc_meta_v0 | select(.key == "commit_sha") | .val // empty')"
+
+          if [[ -z "${SOURCE_REPO}" ]]; then
+            echo "::error::Missing contract meta key source_repo"
+            exit 1
+          fi
+          if [[ -z "${COMMIT_SHA}" ]]; then
+            echo "::error::Missing contract meta key commit_sha"
+            exit 1
+          fi
+          EXPECTED_SOURCE_REPO="github:${EXPECTED_REPO}"
+          if [[ "${SOURCE_REPO}" != "${EXPECTED_SOURCE_REPO}" ]]; then
+            echo "::error::source_repo (${SOURCE_REPO}) != ${EXPECTED_SOURCE_REPO}"
+            exit 1
+          fi
+          if [[ "${COMMIT_SHA}" != "${EXPECTED_SHA}" ]]; then
+            echo "::error::commit_sha (${COMMIT_SHA}) != github.sha (${EXPECTED_SHA})"
+            exit 1
+          fi
+
+      - name: Calculate SHA256 (file == stellar info hash --wasm)
+        id: sha
+        run: |
+          set -euo pipefail
+          FILE_SHA256="$(sha256sum "${WASM_PATH}" | awk '{print $1}' | tr -d '[:space:]')"
+          LOCAL_STELLAR_HASH="$(stellar contract info hash --wasm "${WASM_PATH}" | tr -d '[:space:]')"
+          echo "sha256sum=${FILE_SHA256}"
+          echo "stellar_info_hash_wasm=${LOCAL_STELLAR_HASH}"
+          if [[ "${FILE_SHA256}" != "${LOCAL_STELLAR_HASH}" ]]; then
+            echo "::error::sha256sum (${FILE_SHA256}) != stellar contract info hash --wasm (${LOCAL_STELLAR_HASH})"
+            exit 1
+          fi
+          echo "wasm_sha256=${FILE_SHA256}" >> "${GITHUB_OUTPUT}"
+          mkdir -p artifacts
+          cp "${WASM_PATH}" artifacts/stello_booking_contract.wasm
+          echo "${FILE_SHA256}  stello_booking_contract.wasm" > artifacts/SHA256SUMS
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stello_booking_contract-wasm-${{ github.sha }}
+          path: |
+            artifacts/stello_booking_contract.wasm
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+
+      - name: CI summary
+        run: |
+          {
+            echo "## Stello Booking Contract CI"
+            echo
+            echo "- Commit: \`${{ github.sha }}\`"
+            echo "- Ref: \`${{ github.ref }}\`"
+            echo "- WASM SHA256: \`${{ steps.sha.outputs.wasm_sha256 }}\`"
+            echo "- Interface validation: pass"
+            echo "- Provenance meta: pass"
+            echo "- Deploy: **not performed** (CI only)"
+          } >> "${GITHUB_STEP_SUMMARY}"
